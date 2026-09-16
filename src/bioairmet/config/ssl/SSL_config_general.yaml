@@ -1,0 +1,328 @@
+# =============================================================================
+# BioAirMet - Stage 1: SSL self-supervised pre-training (template)
+#
+# QUICK START
+#   1. Fill in every "CHANGE ME" field below.
+#   2. Dry-run check (prints the fully resolved config + a CHANGE-ME
+#      checklist, then exits; no training, no side effects):
+#        bioairmet-train --config_path <this file> --mode ssl --show_config
+#   3. Launch:
+#        bash run_ssl_training.sh                 # uses this file by default
+#      or with your own copy of the config:
+#        bash run_ssl_training.sh /path/to/your_ssl_config.yaml
+#
+# HOW THIS FILE IS ORGANIZED
+#   The sections always appear in this order (same layout as the
+#   classification template):
+#     RUN -> DATA -> MODEL INITIALIZATION -> ARCHITECTURE -> TRAINING
+#         -> OUTPUT -> DISTRIBUTED
+#   Within each section: USER SETTINGS first (fields you normally edit),
+#   ADVANCED last (tuned defaults; change them only if you know why).
+#
+# The model architecture (backbones, encoders, projector) is NOT defined
+# here. At startup it is resolved from
+#   src/bioairmet/config/architecture/<architecture_setup.architecture_config_name>
+#   (default: architecture_base.yaml)
+# and deep-merged into the config (keys in this file win).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# RUN
+# -----------------------------------------------------------------------------
+project_name: "SSL_SingleIMG_EffB0_FlMLP_ClipLoss"  # used in the experiment folder and log names
+seed: 42
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  # --- USER SETTINGS -------------------------------------------------------
+  # path to the unlabeled dataset for SSL pretraining
+  dataset_path: /path/to/your/unlabeled_data.h5  # CHANGE ME
+
+  # optional explicit validation file; if null, a slice of the train data
+  # (val_split_ratio) is used for validation instead
+  validation_path: null
+
+  # validation split ratio, a portion of the unlabeled data will be used for
+  # validation during SSL training
+  val_split_ratio: 0.1 # (e.g., 0.05 for 5%). Set to 0.0 to disable.
+
+  # subset sampling: use only a fraction of the dataset for quick tests and
+  # debugging. Set to 1.0 to use the full dataset.
+  subset_percentage: 1.0
+
+  # --- ADVANCED ------------------------------------------------------------
+  # change between 1 or 2 images per sample, if 2, both images will be used
+  # for SSL training; the h5 file must contain a list of two image paths
+  # for each sample
+  img_count_per_sample: 1 # number of images per sample/event
+  # name of the image column in the h5 file (see img_count_per_sample=2 note)
+  image_column_name: "images"
+  # name of the fluorescence spectra column in the h5 file; relative_spectra
+  # is already extracted from the json file in (3, 5) shape
+  fluorescence_spectra_column_name: "relative_spectra"
+
+  # shuffle the validation split, or take the last portion of indices
+  shuffle_split: False
+
+  # image resolution, images will be resized to this size during data loading
+  # if not already in this size. This is the resolution used for model input.
+  # Grayscale images are expected.
+  image_size: 200 # square image size (height and width)
+  # ---- If True, the two images are stitched to make one and used for training and testing ----
+  # To be used as the pre-trained weight for the next stage, this should also
+  # be True in the classification stage.
+  stitch_images: False
+
+  img_reader_type: 'legacy' # Options: 'legacy' | 'minmax' | 'global'
+                           #   legacy : 16-bit -> per-image min-max -> 8-bit PIL -> ToTensor [0,1]
+                           #   minmax : per-image min-max on the float tensor -> [0,1]
+                           #   global : divide by the file's full scale (16-bit /65535, 8-bit /255)
+                           # Background is white, so it sits at the top of the range.
+                           # (The corners exposed by rotation/translation are
+                           # filled by augmentation.image_transforms.fill,
+                           # 'border' by default.)
+  image_normalization:
+    enable: False # True or False to enable/disable image normalization
+    # mean and std for image normalization, used if image_normalization.enable is True
+    img_mean: [0.883232]
+    img_std: [0.139312]
+
+  augmentation:
+    # image augmentation settings
+    img_aug_prob: 0.25 # Probability of the image augmentation pipeline.
+                       # 0.25 is the pre-refactor value; raise it for stronger
+                       # augmentation in new runs.
+    legacy_img_aug: True # True = fixed hard-coded legacy pipeline (the image_transforms
+                          # block below is ignored); False = build the pipeline from the
+                          # image_transforms block (missing/empty block = no augmentation)
+
+    # --- Custom-mode per-transform image augmentation (used only when legacy_img_aug is False) ---
+    #     flipping  = horizontal_flip / vertical_flip
+    #     rotation  = angle (degrees) + translation (fraction of width/height)
+    #     speckle_noise / gamma_correction / cutout = pixel ops tailored to this
+    #       hologram corpus (200x200 grayscale, particle centered); the cutout
+    #       only erases a small rectangle outside the protected central disk
+    #       (clear_center * image/2), filled with the fill colour.
+    # Each entry is { enabled: true/false, prob: p, ...params }.
+    # color_jitter also accepts saturation / hue.
+    #
+    # The values below mirror the pre-refactor SSL pipeline (the old code's
+    # legacy_img_aug: False branch); see docs/configuration.md, "Reproducing
+    # the pre-refactor pipeline". speckle_noise / gamma_correction / cutout
+    # are off by default.
+    image_transforms:
+      parallel_flipping_rotation: false # true = one shared flip/rotation decision for both
+                                        # views of an image pair (custom mode only; ignored in legacy mode)
+      fill: 'border' # Colour of the pixels revealed by rotation/translation/affine,
+                    # in both modes, and by the cutout in custom mode.
+                    # 'border' (default): median of each image's outer 1-pixel
+                    # ring, computed per image at call time, so the exposed
+                    # edge matches the image's own edge colour.
+                    # Also: 'white' (the corpus background), 'black',
+                    # or a number in [0, 1] (tensor domain).
+      horizontal_flip: 
+        enabled: true
+        prob: 0.5
+      vertical_flip:   
+        enabled: true
+        prob: 0.5
+      rotation:
+        enabled: true
+        prob: 0.5
+        angle: 180                    # rotation angle (degrees)
+        translation: [0.05, 0.05]     # translation (dx, dy)
+        interpolation: nearest        # old RandomAffine default (nearest, integer pixels)
+        translate_round: true         # old RandomAffine rounds to integer pixels
+      color_jitter:
+        enabled: true
+        prob: 0.5
+        brightness: 0.5
+        contrast: 0.5
+      gaussian_blur:
+        enabled: true
+        prob: 0.5
+        kernel_size: 3
+        sigma: [0.1, 2.0]
+      gaussian_noise:
+        enabled: true
+        prob: 0.5
+        std: 0.05
+      speckle_noise:
+        enabled: false                # OFF by default - set to true to enable
+        prob: 0.4
+        sigma: 0.05                   # multiplicative speckle: img * (1 + sigma * N(0,1))
+      gamma_correction:
+        enabled: false                # OFF by default - set to true to enable
+        prob: 0.3
+        gamma: [0.7, 1.3]             # img ** g with g drawn uniformly from [lo, hi]
+      cutout:
+        enabled: false                # OFF by default - set to true to enable
+        prob: 0.3
+        count: [1, 4]                 # how many squares are erased per draw (1 = a single square)
+        size: [0.02, 0.06]            # erased square as a fraction of the image width (4-12 px at 200 px)
+        clear_center: 0.6             # nothing within 0.6 * (image/2) = 60 px of the center is ever erased
+
+    # fluorescence data augmentation settings
+    fluo_aug_prob: 0.0 # Probability for fluorescence data augmentations
+    fluo_augment_style: "covariance_style_augmentation" # Options: "pca_jitter" (alias: "pca"), "covariance_style_augmentation", null (disable)
+    fluo_pca_std: 0.1 # Jitter magnitude (std) used by the "pca_jitter" fluorescence augmentation
+
+# -----------------------------------------------------------------------------
+# MODEL INITIALIZATION
+# -----------------------------------------------------------------------------
+# Where the starting weights come from. Leave BOTH options disabled for a
+# fresh (randomly initialised) start. Enable AT MOST ONE of the two:
+#
+#   pretrained: warm start from an existing SSL checkpoint (.pth)
+#   resume:     continue an interrupted SSL run: restores the epoch and
+#                (optionally) the optimizer state; the architecture is taken
+#                from the checkpoint's experiment directory automatically
+model_initialization:
+  pretrained:
+    enable: False
+    # Path to an SSL checkpoint (.pth) to initialise the model from.
+    checkpoint_path: null
+
+  resume:
+    enable: False
+    # Experiment checkpoint to continue from, e.g.
+    # /path/to/your/ssl_experiment_dir/last_ssl_model.pth
+    checkpoint_path: null
+    # Also restore optimizer/scheduler state (recommended for true resuming)
+    load_optimizer: False
+
+# -----------------------------------------------------------------------------
+# ARCHITECTURE
+# -----------------------------------------------------------------------------
+architecture_setup:
+  # Architecture file in src/bioairmet/config/architecture/ (e.g.
+  # architecture_base.yaml, EfffV2_100k_architecture.yaml, ...)
+  architecture_config_name: "architecture_base.yaml"
+  # Optionally point at an explicit architecture file instead of the name above:
+  # architecture_config_path: /path/to/some_architecture.yaml
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+train:
+  # --- USER SETTINGS -------------------------------------------------------
+  epochs: 100
+  batch_size: 512 #512 #256 #1024
+  num_workers: 12
+
+  # --- ADVANCED ------------------------------------------------------------
+  optimizer:
+    name: "AdamW"
+    lr: 0.001 #0367 # Increased learning rate to combat collapse
+    weight_decay: 0.05
+    # eps: 0.0005 # custom eps set to 2.5e-4 for AdamW to improve stability in SSL fine-tuning, 1e-6=0.000001, 1e-5=0.00001, 1e-4=0.0001
+    # betas: [0.9, 0.98] # Lower beta2 for more stable updates in SSL, especially with larger batch sizes
+
+  gradient_accumulation_steps: 1 # Number of steps to accumulate gradients before updating weights, when 1, no gradient accumulation
+  mixed_precision: True # Enable/Disable Automatic Mixed Precision (AMP)
+
+  # --- THROUGHPUT SWITCHES ----------------------------------------------------
+  # All three default to OFF in code; this template turns the first two on.
+  # Measured during development (batch 64, 200x200, EfficientNet v2_100k,
+  # forward+backward):
+  #   fp32 NCHW 17.2k -> fp32 NHWC 21.2k -> AMP NCHW 21.3k -> AMP NHWC 36.3k img/s
+  cudnn_benchmark: False # cuDNN auto-tunes conv algorithms. Worth it here because
+                        # every step uses the same (fixed) input size; the price is a
+                        # slower first pass and re-tuning if shapes change.
+  tf32: False # TF32 for fp32 matmul/conv on Ampere+ GPUs. Consistent with AMP being
+             # on; set False if you need full fp32 mantissa precision.
+  channels_last: False # NHWC memory format for model + inputs (biggest win on these
+                       # small conv nets, see numbers above). Left off by default so
+                       # results stay comparable with previous NCHW runs.
+
+  gradient_clipping:
+    enable: True # Set to True to enable gradient clipping
+    # when enabled, the following settings determine how to perform gradient clipping:
+    clipping_mode: "fixed" # options: "adaptive", "fixed".
+    # when mode : 'adaptive' it uses 1/scaler for clipping
+    # mode : 'fixed'
+    clip_value: 1.0 # The maximum norm of the gradients when clipping mode is fixed
+
+  gradient_regularization:
+    enable: False # Set to True to enable gradient regularization
+    norm_mode: "gradient_noise" # options: "gradient_noise", "l2_norm", "linf_norm", "img_encoder_grad_down_scaling"
+    # mode: "l2_norm", Maximum norm for L2 normalization, adjust based on observed gradient norms to prevent collapse while allowing effective learning
+    max_norm: 1.0 # Maximum norm for gradient normalization
+    # better to be used when clipping is fixed.
+    # mode: "gradient_noise", Standard deviation of the noise to add to gradients, adjust based on observed training dynamics to prevent collapse while allowing effective learning
+    noise_std: 0.00001 #1e-5 # mode: "gradient_noise", Standard deviation of the noise to add to gradients
+    # mode: "img_encoder_grad_down_scaling", Whether to scale down image encoder gradients, this is a simple way to prevent collapse by reducing the learning rate for the image encoder while allowing the rest of the model to learn effectively. Adjust the scaling factor based on observed training dynamics.
+    imgEnc_grad_scale: 0.1 # mode: "img_encoder_grad_down_scaling", Scaling factor for image encoder gradients when scale_down_imgEnc_grads is True
+    # mode: "step_scaling", Maximum allowed step size for gradients, adjust based on observed gradient norms to prevent collapse while allowing effective learning
+    grad_scale: 0.0001 #3 # 3e-5 # Gradient scaling factor for "step_scaling" clipping mode, adjust based on observed gradient norms to prevent collapse while allowing effective learning
+
+  # Learning-rate scheduler. Set name: "None" to disable scheduling.
+  # Other available schedulers and their parameters: docs/configuration.md
+  #
+  # STEP-BASED schedulers (OneCycleLR, CLIPCosineWarmupScheduler) are advanced once
+  # per OPTIMISER update, so the cycle length is derived automatically as
+  #   total_steps = epochs * ceil(steps_per_epoch / gradient_accumulation_steps)
+  # and the anneal finishes exactly at the last update (the log prints
+  # "[scheduler] ... total_steps=..."). Keep epochs below equal to train.epochs.
+  scheduler:
+    name: "OneCycleLR"
+    max_lr: 0.001 # Upper learning-rate boundary
+    epochs: 100 # Cycle length in epochs; keep equal to train.epochs (or delete the
+                # key to follow train.epochs automatically; only change it if you know
+                # why, e.g. an intentionally shorter cycle than the run)
+    anneal_strategy: "cos" # "cos" for cosine annealing, "linear" for linear annealing
+    pct_start: 0.05 # Percentage of the cycle spent increasing the learning rate
+    div_factor: 50 # Initial learning rate = max_lr / div_factor
+    final_div_factor: 100000 # Minimum learning rate = initial_lr / final_div_factor
+    # total_steps: null # absolute override of the cycle length (optimiser steps)
+
+  loss:
+    name: "ContrastiveLoss" # SigLIPLoss, ContrastiveLoss
+    temperature: 0.1 # Higher temperature prevents overconfident predictions and representation collapse
+    learnable_temp: False
+    # loss settings on DDP
+    emulate_old_loss: True # Whether to emulate the old loss behavior where the loss is computed on each GPU locally without gathering features across GPUs.
+    # if above is True, the following is ignored, if False, the following settings determine how to compute the loss in DDP:
+    local_loss: True # Whether to compute loss locally on each GPU without gathering features across GPUs.
+    gather_with_grad: True # Whether to gather features with gradients for loss computation in DDP.
+
+  early_stopping:
+    patience: 100
+    min_delta: 0.001
+
+  fine_tuning:
+    bn_bias_no_decay: False # Whether to exclude BatchNorm and bias parameters from weight decay
+    freeze_image_encoder: False
+    freeze_fluorescence_encoder: False
+    image_encoder_lr_multiplier: 1.0
+    fluorescence_encoder_lr_multiplier: 1.0
+    projection_head_lr_multiplier: 1.0
+    temperature_lr_multiplier: 1.0
+
+# -----------------------------------------------------------------------------
+# OUTPUT / LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  # Root output directory; each run creates
+  # <checkpoint_dir>/<timestamp>_<project_name>/ with checkpoints, config.yaml,
+  # architecture.yaml and logs/
+  checkpoint_dir: "/path/to/your/ssl_checkpoints"  # CHANGE ME
+  # Write TensorBoard event files into the experiment directory
+  tensorboard: False
+
+# -----------------------------------------------------------------------------
+# DISTRIBUTED (GPUs)
+# -----------------------------------------------------------------------------
+# The launcher script (run_ssl_training.sh) controls which GPUs are VISIBLE
+# via its GPU_IDS variable (CUDA_VISIBLE_DEVICES). With the defaults below,
+# training uses every GPU the script makes visible; no extra syncing needed.
+# To pin a single specific GPU, set: world_size: 1  +  gpu_ids: [0]
+# (gpu_ids are indices into the visible GPUs, i.e. into the script's GPU_IDS).
+distributed:
+  enable: True # Set to True for DistributedDataParallel training
+  world_size: -1 # -1 = all visible GPUs, 1 = single GPU, or a specific number
+  gpu_ids: [] # Visible GPU indices to use (e.g. [0, 1]); empty = all visible GPUs
+  master_addr: "localhost"
+  master_port: "11059"

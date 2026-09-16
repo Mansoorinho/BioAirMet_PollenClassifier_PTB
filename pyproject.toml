@@ -1,0 +1,94 @@
+[build-system]
+# setuptools >= 77.0 is required for PEP 639 license metadata (SPDX expression)
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bioairmet"
+version = "1.0.0"
+description = "Two-stage deep learning framework for pollen classification using holographic images and fluorescence spectra"
+
+authors = [
+    { name="BioAirMet Team", email="mansoor.nabawi@ptb.de" },
+    { name="BioAirMet Team", email="Tobias.Klein@ptb.de" }
+] 
+
+readme = "README.md"
+# PEP 639: license expressed as an SPDX identifier (requires setuptools >= 77.0)
+license = "MIT"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+keywords = ["deep-learning", "pollen-classification", "ssl", "contrastive-learning", "holography", "fluorescence"]
+
+# Version lower bounds match the validated POLENO_env environment.
+# NOTE: CUDA runtime libraries (cublas, cudnn, nccl, ...) are installed as
+# transitive dependencies of the torch/torchvision/torchaudio wheels matched
+# to the host CUDA version (e.g. cu128 for torch>=2.8.0). They are intentionally
+# NOT pinned here to avoid conflicting cu11/cu12 extras.
+dependencies = [
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "timm>=1.0.16",
+    "h5py>=3.14.0",
+    "numpy>=2.1.2",
+    "pillow>=11.0.0",
+    "pandas>=2.3.0",
+    "pyyaml>=6.0.2",
+    "easydict>=1.13",
+    "psutil>=7.0.0",
+    "tqdm>=4.67.1",
+    "tensorboard>=2.19.0",
+    "scikit-learn>=1.7.0",
+    "matplotlib>=3.10.3",
+    "seaborn>=0.13.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0",
+    "flake8>=6.0",
+    "mypy>=1.0",
+]
+wandb = [
+    "wandb>=0.15.0",
+]
+
+[project.urls]
+Homepage = "https://www.bioairmet.ptb.de/home"
+#Repository = "" # TODO: add repository URL if public
+#Documentation = "" # TODO: add documentation URL if available
+#Issues = "" # TODO: add issue tracker URL if public
+
+[project.scripts]
+bioairmet-train     = "bioairmet.cli:main_train"
+bioairmet-inference = "bioairmet.cli:main_inference"
+bioairmet-validate  = "bioairmet.cli:main_validate"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bioairmet*"]
+exclude = ["tests*", "*.egg-info"]
+
+[tool.setuptools.package-data]
+bioairmet = [
+    "config/**/*.yaml",
+    "config/**/*.yml",
+    "config/**/*.txt",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'

@@ -1,0 +1,32 @@
+# config/architecture/architecture_base.yaml
+# --- Architecture configuration for BioAirMet model ---
+# This configuration will be used in both stages.
+
+ssl_model:
+  model_name: "SSLModel_SingleIMG" 
+  projection_dim: 256
+  projector_type: "small" # options: 'small', 'small_norm', 'big'
+  projector_bias: True
+  # when projector_type: 'small_norm' or 'big'
+  projector_norm: "bn" # default: 'bn', options: 'bn' for batchnormalization, 'ln' for layernormalization. 
+  projector_activation: "relu" # default: 'relu', options: 'relu' or 'gelu'
+  
+image_tower:
+  model_name: "efficientnet_b0" # e.g. efficientnet_{b0-b7,v2_s,v2_m,v2_l,v1_100k,v1_250k,v2_100k,v2_250k}, mobilenet_v3_{tiny,small,large}, fastvit_{t8,t12,s12}, shufflenet_v2_{x0_5,x1_0,x1_5,x2_0}, mnasnet_{0_5,0_75,1_0,1_3} — or a custom family registered in models/custom_models.py (e.g. mycnn_small, mycnn_wide)
+  pretrained: False # Set to True to load ImageNet pretrained weights (ignored for the custom v1_*/v2_* ultra-tiny variants, which are random-init)
+
+
+fluorescence_tower:
+  model_name: "FluorescenceMLP" # built-in: FluorescenceMLP, FluorescenceMLP_Simple; templates: FluorescenceCNN (models/custom_models.py)
+  # fluorescence tower settings
+  # number of fluorescence input
+  input_dim: 13
+  # last linear layer output dimension
+  output_dim: 256
+  # hidden layer dimensions, should be a list, e.g. [128, 256]
+  # to add more hidden layers, just add more values to the list
+  hidden_dim: [128]
+  # dropout probability for MLP
+  dropout: 0.25
+  activation: 'relu' # options: 'relu, 'gelu'
+  norm: 'bn' # options: 'bn', 'ln', None

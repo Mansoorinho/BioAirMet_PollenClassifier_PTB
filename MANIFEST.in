@@ -1,0 +1,30 @@
+# MANIFEST.in - Specify additional files to include in distribution
+
+# Include documentation
+include README.md
+include LICENSE
+include *.md
+
+# Include configuration files
+recursive-include src/bioairmet/config *.yaml
+recursive-include src/bioairmet/config *.yml
+recursive-include src/bioairmet/config *.txt
+
+# Include requirements
+include requirements.txt
+include pyproject.toml
+include setup.py
+
+# Exclude development/cache files
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *$py.class
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.egg-info
+
+# Exclude test and development directories
+prune tests
+prune .git
+prune .github
+prune docs/_build
