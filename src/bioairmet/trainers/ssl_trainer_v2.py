@@ -30,7 +30,9 @@ from tqdm import tqdm
 import numpy as np
 import random
 
-from .base_trainer_v2 import BaseTrainerV2, build_stage_dataloaders
+from .base_trainer_v2 import (BaseTrainerV2, build_stage_dataloaders,
+                              build_worker_init_fn, make_augmentation_epoch_counter,
+                              worker_seeding_enabled)
 from ..models import build_model_from_config
 from ..data import build_dataset_from_config
 from ..utils import (
@@ -271,9 +273,11 @@ class SSLTrainerV2(BaseTrainerV2):
         if self.config.train.gradient_clipping.enable:
             self._apply_gradient_clipping(grad_norm, clip_ui)
         
-        # Apply gradient manipulation based on norm_mode
-        if getattr(self.config.train.gradient_regularization, "enable", False):
-            norm_mode = self.config.train.gradient_regularization.get("norm_mode", "gradient_noise")
+        # Apply gradient manipulation based on norm_mode. The section flag is
+        # 'enable' (as in every shipped config); 'enabled' is accepted too.
+        grad_reg = self.config.train.get("gradient_regularization", {}) or {}
+        if grad_reg.get("enable", grad_reg.get("enabled", False)):
+            norm_mode = grad_reg.get("norm_mode", "gradient_noise")
             
             if norm_mode == "gradient_noise":
                 self._apply_gradient_noise(clip_ui)
@@ -361,14 +365,11 @@ class SSLTrainerV2(BaseTrainerV2):
         
         clip_ui['scale'] = f"{grad_scale:.2e}"
     
-    def _apply_imgenc_grad_scaling(self, clip_ui: Dict[str, str]) -> None:
-        """Scale down gradients for image encoder parameters."""
-        imgEnc_grad_scale = self.config.train.gradient_regularization.get("imgEnc_grad_scale", 0.1)
-        for name, param in self.model.named_parameters():
-            if param.grad is not None and 'image_encoder' in name:
-                param.grad.data *= imgEnc_grad_scale
-        
-        clip_ui["imgEnc_grad_scale"] = f"{float(imgEnc_grad_scale):.2e}"
+    # _apply_imgenc_grad_scaling() is inherited from BaseTrainerV2, where it
+    # matches the encoder by its top-level module name ('img_encoder', plus the
+    # DDP 'module.' level). The local copy this replaces tested the substring
+    # 'image_encoder', which no parameter name contains, so the
+    # 'img_encoder_grad_down_scaling' mode silently left every gradient alone.
 
     
     def train_epoch(self, train_loader: DataLoader, epoch: int) -> Dict[str, float]:
@@ -654,16 +655,12 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     from torch.utils.data import DataLoader, DistributedSampler
     from functools import partial
     
-    # Worker init function for HDF5
-    def _worker_init_fn(worker_id, base_seed, rank):
-        import random
-        import numpy as np
-        import torch
-        worker_seed = base_seed + rank + worker_id
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-        random.seed(worker_seed)
-        # os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+    # Worker seeding (train.worker_seeding, default ON) lives in
+    # build_worker_init_fn (used below, after the datasets are built): it keeps
+    # PyTorch's auto-seeded worker torch RNG untouched — the stream that gave
+    # the most robust SSL runs — and seeds only the numpy/random +
+    # augmentation RNGs that fork() would otherwise leave duplicated across
+    # workers, refreshing them per epoch.  OFF => no worker_init_fn at all.
     
     # CRITICAL: Build datasets BEFORE model to match legacy RNG state
     # Dataset building consumes random numbers (augmentation setup, shuffling)
@@ -673,17 +670,33 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
     print(f"Seed set to {seed} for random, numpy, torch, and cudnn.")
     
     train_dataset, val_dataset = build_dataset_from_config(config)
     
+    # Worker seeding (train.worker_seeding); needs the training dataset, which
+    # was just built above.  When ON, the shared epoch counter is also created
+    # here and handed to the trainer below, which publishes every new epoch into
+    # it so the persistent workers refresh their non-torch RNG streams at the
+    # epoch boundary.  When OFF, no worker_init_fn is passed at all.
+    if worker_seeding_enabled(config):
+        aug_epoch_counter = make_augmentation_epoch_counter()
+        worker_init_fn = build_worker_init_fn(train_dataset,
+                                              epoch_counter=aug_epoch_counter)
+    else:
+        aug_epoch_counter = None
+        worker_init_fn = None
+
     # Create trainer and setup model.
     # skip_seed=True because seed was already set above before dataset building.
     # Passing skip_seed=False would reset the RNG here and give different weight
     # initialization compared to legacy (which sets seed once before datasets).
     trainer = SSLTrainerV2(config, rank, world_size, device_id, skip_seed=True)
+    # Same counter the workers above received (None when worker seeding is off):
+    # the epoch loop of BaseTrainerV2.train() publishes each epoch into it.
+    trainer.attach_augmentation_epoch_counter(aug_epoch_counter)
     # trainer.setup()
     # moved after dataloader to use the steps per epoch in scheduler
     
@@ -691,12 +704,12 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     # build_stage_dataloaders for the exact semantics).
     train_loader, val_loader = build_stage_dataloaders(
         config, train_dataset, val_dataset, rank, world_size,
-        train_drop_last=True,      # contrastive loss needs full batches
-        val_drop_last=True,
+        train_drop_last=False,      # contrastive loss needs full batches
+        val_drop_last=False,
         train_always_sharded=True,  # SSL always uses a DistributedSampler
         val_sharded=False,          # validation runs on rank 0 only
         val_rank0_only=True,
-        worker_init_fn=lambda wid: _worker_init_fn(wid, config.seed, rank),
+        worker_init_fn=worker_init_fn,
     )
     trainer.setup(steps_per_epoch=len(train_loader))
     if rank == 0:
@@ -705,15 +718,7 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
             f"num_workers={config.train.num_workers} (as configured in train)"
         )
     
-    # Log the dataset sizes (rank 0).  The full data-augmentation block — the
-    # legacy-vs-enhanced switch, every image transform with its probability and
-    # parameters, and the fluorescence augmentation — is written at the start of
-    # BaseTrainerV2.train() via the shared _log_augmentation_info() helper, so
-    # SSL and classification emit the identical "--- Data Augmentation (TRAIN)
-    # ---" block.  (An earlier version read the training dataset's
-    # ``augmentation`` attribute here, but the config-driven Stage1Dataset
-    # exposes ``transform``/``fluorescence_augmentation`` instead, so that check
-    # never matched and silently logged nothing.)
+    # Log the dataset sizes (rank 0). 
     if rank == 0:
         trainer.model_logger.info(f"Train dataset size: {len(train_dataset)}")
         if val_dataset:

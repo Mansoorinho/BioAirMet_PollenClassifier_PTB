@@ -48,6 +48,37 @@ bioairmet-validate --experiment_dir DIR --data_path PATH [options]
 | `--save_path` | No | `./validation_results` | Output directory (`--plot_path` is a deprecated alias) |
 | `--gpu_id` | No | `0` | GPU index, `-1` for CPU |
 | `--batch_size` | No | *(from config)* | Override batch size |
+
+### How evaluation is executed
+
+All three evaluation paths — the per-epoch validation of the classification
+trainer, `bioairmet-validate`, and `bioairmet-inference` on a labeled HDF5 file —
+follow the same rules, so their numbers are directly comparable:
+
+| Aspect | Behaviour |
+|---|---|
+| Preprocessing | Same `data.img_reader_type`, `data.image_size`, `data.image_normalization` (honoured only when its `enable` flag is set) and `data.stitch_images` as training — they are passed through `image_reader_kwargs(config.data)`. |
+| Augmentation | Forced off for evaluation: `img_aug_prob = 0.0` and `fluo_aug_prob = 0.0`, so validation/inference always see clean samples. |
+| Out-of-range labels | Rows with `label >= architecture_setup.classification_model.num_classes` are dropped (same rule as the training dataset); the head cannot represent them. |
+| Model state | `model.eval()` + `torch.no_grad()`. BatchNorm keeps `track_running_stats=True` and normalises with the *stored* running statistics. Nothing may set `track_running_stats=False`: that flag switches tracking off, and per the PyTorch BatchNorm contract a non-tracking layer normalises with **batch** statistics — which would tie a prediction to the other samples in its batch (and zero the features at batch size 1). The model summary logs the state: `BatchNorm: N layer(s) in eval mode, N/N tracking running statistics`. |
+| Precision | `torch.amp.autocast` is enabled **only** when the bundled config sets `train.mixed_precision: true`; otherwise everything runs in fp32 — on CPU *and* on CUDA. |
+| L2 feature normalisation | `feature_l2_normalization_enabled` is read from the experiment bundle, so training, validation and inference normalise identically: each of `view_a`, `view_b` and the fluorescence feature is unit-L2-normalised separately, then concatenated. |
+| DDP | Validation runs on every rank over its `DistributedSampler` shard; loss and top-1 are summed and divided by the **global** sample count (`all_reduce`), and the per-sample predictions are gathered to rank 0 for the confusion matrix. |
+| Final confusion matrix | Computed from the **best** checkpoint on the *unsharded* validation set (rank 0), after training ends. |
+| Batch-size independence | With the frozen encoders in eval mode, a sample's prediction does not depend on its batch mates (`bs=8` and `bs=1` give identical probabilities). |
+
+> **Behaviour change (evaluation audit).** `bioairmet-inference` used to force
+> fp16 autocast whenever CUDA was available (even for fp32-trained models), and
+> both `inference._prepare_model()` and
+> `validate_classification_v2.prepare_model_for_validation()` used to set
+> `track_running_stats=False` on every BatchNorm layer — their comment claimed
+> "force BatchNorm to use stored statistics", which is the opposite of what that
+> flag means. Both helpers now leave `track_running_stats` alone (`eval()` is
+> sufficient and version-proof), and inference follows
+> `train.mixed_precision`. In addition, `bioairmet-validate` now receives the
+> same reader options and the same `num_classes` label filtering as training, and
+> the legacy distributed test loop reports the all-reduced accuracy instead of
+> rank 0's shard only.
 ---
 
 ## Inference

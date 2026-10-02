@@ -619,7 +619,12 @@ def _resolve_initialization(config) -> Tuple[str, Optional[str]]:
         return 'none', None
 
     # Resume: checkpoint of a previous classification run.
+    # Unified location (model_initialization.resume) with the legacy
+    # top-level `resume` fallback — the same resolution the trainers and
+    # the architecture pinning use (see get_resume_section in config_parser).
     resume = _section(model_init, 'resume')
+    if not resume:
+        resume = _section(config, 'resume')
     if resume.get('enable', False):
         weights_path = resume.get('checkpoint_path')
         if not weights_path:

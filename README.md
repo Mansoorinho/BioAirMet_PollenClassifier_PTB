@@ -22,6 +22,7 @@ Everything runs through three CLI tools: `bioairmet-train`,
 - [Installation](#installation)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
+- [Download model weights](#download-model-weights)
 - [I already have a trained classification experiment](#i-already-have-a-trained-classification-experiment)
 - [Fine-tuning an existing classifier on your own dataset](#fine-tuning-an-existing-classifier-on-your-own-dataset)
 - [Use your own encoder](#use-your-own-encoder)
@@ -265,6 +266,42 @@ Validation works the same way — see [docs/inference.md](docs/inference.md).
 
 ---
 
+## Export a trained classifier to ONNX
+
+Any trained classification experiment can be exported to self-contained
+ONNX models (opset 17, dynamic batch, float32, CPU-verified with ONNX
+Runtime). By default BOTH checkpoints of the experiment are exported —
+everything (class count, image size, image reader, class names, ...) is
+read from the full experiment directory:
+
+```bash
+# Export BOTH checkpoints: <exp>/onnx/best/ and <exp>/onnx/last/
+# (each directory contains model.onnx + a self-describing README.md)
+python -m bioairmet.utils.export_onnx --experiment-dir /path/to/exp
+
+# Or export a single checkpoint:
+python -m bioairmet.utils.export_onnx \
+    --checkpoint /path/to/exp/last_classification_model.pth
+```
+
+The exported models take one flat input `X` of shape `[batch, 80013]`
+(13-dim fluorescence spectrum + two 200x200 grayscale views, row-major, in
+`[0, 1]`) and return `label` (int64 `[batch]`) and `probabilities`
+(float32 `[batch, C]`, C = the experiment's number of classes). Class names
+are embedded in the model metadata (`sws.class_names`), and each export is
+verified against the PyTorch model on real validation samples by default.
+The image values must be built with the same reader the model was trained
+with — the model records it in its `sws.image_reader` metadata (e.g.
+`legacy`: min-max → 8-bit → resize). Full reference — input layout,
+training-matched preprocessing (`build_flat_features`), ONNX Runtime
+consumption, troubleshooting — is in
+[docs/onnx_export.md](docs/onnx_export.md).
+
+Install the (optional) export/consumption deps: `pip install onnx onnxruntime`
+(or `pip install .[onnx]`).
+
+---
+
 ## Fine-tuning an existing classifier on your own dataset
 
 Already have a trained classification experiment and new labeled data? Adapt the
@@ -367,6 +404,7 @@ Full walkthrough: [docs/custom_models.md](docs/custom_models.md).
 | Building & loading models, checkpoints, `load_model` | [docs/model_loading.md](docs/model_loading.md) |
 | Custom image / fluorescence encoders, `register_backbone`, templates | [docs/custom_models.md](docs/custom_models.md) |
 | Validation, inference, Python API, outputs | [docs/inference.md](docs/inference.md) |
+| ONNX export — input layout, verification, ONNX Runtime consumption | [docs/onnx_export.md](docs/onnx_export.md) |
 | Common errors and log messages explained | [docs/troubleshooting.md](docs/troubleshooting.md) |
 
 ---

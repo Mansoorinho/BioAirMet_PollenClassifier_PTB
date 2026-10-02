@@ -1,7 +1,7 @@
 '''
 @file    :   base_trainer_v2.py
 @create date : 2026-01-10 14:04:08
-@modify date 2026-05-27 16:05:54
+@modify date 2026-09-27 16:05:54
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -29,6 +29,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -41,11 +42,18 @@ from ..utils import (
     log_metrics_to_file,
     step_scheduler,
     is_step_based_scheduler,
+    restore_scheduler_state,
     log_bn_and_freeze_state,
     bn_state_line,
     bn_freeze_warnings,
 )
 from ..models._common import strip_ddp_prefix, ensure_state_dict_metadata
+from ..data.datasets_cls import (
+    AUG_EPOCH_SEED_STRIDE,
+    make_augmentation_epoch_counter,
+    seed_worker_rngs,
+    set_augmentation_epoch,
+)
 
 
 class BaseTrainerV2(ABC):
@@ -121,6 +129,12 @@ class BaseTrainerV2(ABC):
         # train.channels_last).  All default to off => behaviour unchanged.
         self.use_channels_last = self._configure_performance()
         
+        # Shared epoch counter (train.worker_seeding ON): lets the DataLoader
+        # workers refresh their numpy/random/aug-RNG streams every epoch.  The
+        # stage workers create it (they build the worker_init_fn) and hand it
+        # back through attach_augmentation_epoch_counter(); None => feature off.
+        self.augmentation_epoch_counter = None
+        
         # Placeholders for model, optimizer, scheduler (set by subclasses)
         self.model: Optional[nn.Module] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
@@ -144,11 +158,54 @@ class BaseTrainerV2(ABC):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
         
         if self.rank == 0:
             self.model_logger.info(f"Seed set to {seed}")
+
+    def attach_augmentation_epoch_counter(self, counter) -> None:
+        """Register the shared epoch counter used to re-seed DataLoader workers.
+
+        Called by the stage workers right after they built it (see
+        :func:`worker_seeding_enabled`): the same object goes into
+        :func:`build_worker_init_fn` (so every worker inherits it) and here (so
+        the epoch loop can publish each new epoch).  Passing ``None`` leaves the
+        workers' non-torch RNG streams at the state they were created with.
+        """
+        self.augmentation_epoch_counter = counter
+
+    def _advance_augmentation_epoch(self, epoch: int) -> None:
+        """Publish ``epoch`` so the persistent workers re-seed their RNG streams.
+
+        A no-op when the feature is off (``augmentation_epoch_counter`` is
+        ``None``).  Workers pick the new value up on the next sample they fetch;
+        batches already sitting in the prefetch queue keep the previous epoch's
+        stream.
+        """
+        set_augmentation_epoch(self.augmentation_epoch_counter, epoch)
+
+    def _log_worker_seeding_policy(self, train_loader) -> None:
+        """Log the worker-seed policy once (rank 0, start of ``train()``)."""
+        num_workers = int(getattr(train_loader, 'num_workers', 0) or 0)
+        if num_workers == 0:
+            self.model_logger.info(
+                "Worker RNG seeding: n/a (num_workers=0 — no worker processes, "
+                "augmentations are drawn in the main process)"
+            )
+        elif self.augmentation_epoch_counter is not None:
+            self.model_logger.info(
+                "Worker RNG seeding: ON (robust scheme) for "
+                f"{num_workers} worker(s) — worker torch RNG keeps PyTorch's "
+                "auto-seed; numpy/random/aug-RNGs are seeded per worker and "
+                f"refreshed every epoch (+epoch*{AUG_EPOCH_SEED_STRIDE})"
+            )
+        else:
+            self.model_logger.info(
+                "Worker RNG seeding: OFF (no worker_init_fn) for "
+                f"{num_workers} worker(s) — PyTorch auto-seeds the worker torch "
+                "RNG; numpy/random/aug-RNGs keep the fork-duplicated state"
+            )
 
     def _configure_performance(self) -> bool:
         """Apply the optional ``train.*`` throughput switches.
@@ -220,6 +277,54 @@ class BaseTrainerV2(ABC):
                     "Model parameters converted to channels_last (NHWC) memory format"
                 )
         return model
+
+    # ------------------------------------------------------------------
+    # Gradient-regularisation helpers (shared by both stages)
+    # ------------------------------------------------------------------
+    def _apply_imgenc_grad_scaling(self, clip_ui: Dict[str, str]) -> None:
+        """Scale the image-encoder gradients down
+        (``train.gradient_regularization.norm_mode:
+        'img_encoder_grad_down_scaling'``).
+
+        The encoder is matched by its TOP-LEVEL module name: both
+        ``SSLModel_SingleIMG`` and ``HoloClassifierV2`` name it
+        ``img_encoder``, and under DDP every parameter name carries one extra
+        ``module.`` level. (The original SSL-stage implementation tested the
+        substring ``'image_encoder'``, which no parameter name contains, so the
+        mode silently multiplied nothing.)
+
+        A frozen encoder produces no gradients at all, so "nothing matched" is
+        a legitimate state — it is reported once instead of being hidden behind
+        the ``imgEnc_grad_scale`` value that is logged for the tqdm bar.
+        """
+        grad_reg = self.config.train.get("gradient_regularization", {}) or {}
+        scale = float(grad_reg.get("imgEnc_grad_scale", 0.1))
+
+        matched = 0
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            top = name.split(".", 1)[0]
+            if top == "module":  # DDP wrapper adds one level of nesting
+                top = name[len("module."):].split(".", 1)[0]
+            if top in ("img_encoder", "image_encoder"):
+                param.grad.data.mul_(scale)
+                matched += 1
+
+        clip_ui["imgEnc_grad_scale"] = f"{scale:.2e}"
+
+        if not matched and self.rank == 0 and not getattr(
+                self, "_imgenc_grad_scale_warned", False):
+            self._imgenc_grad_scale_warned = True
+            self.model_logger.warning(
+                "gradient_regularization.norm_mode="
+                "img_encoder_grad_down_scaling scaled nothing: no parameter "
+                "with gradients was found under the image encoder "
+                "('img_encoder.*'). That is expected while the image encoder "
+                "is frozen (it produces no gradients); to slow the encoder "
+                "down instead, use train.fine_tuning."
+                "image_encoder_lr_multiplier."
+            )
 
     def _log_bn_freeze_audit(self, header: str = "BatchNorm / Freeze audit") -> None:
         """Log the freeze + BatchNorm tables (rank 0) and any divergence warnings.
@@ -471,6 +576,16 @@ class BaseTrainerV2(ABC):
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
+        # Add early-stopping state (patience counter + best score)
+        if self.early_stopping is not None:
+            checkpoint['early_stopping_state'] = {
+                'best_score': self.early_stopping.best_score,
+                'counter': self.early_stopping.counter,
+                'patience': self.early_stopping.patience,
+                'min_delta': self.early_stopping.min_delta,
+                'mode': self.early_stopping.mode,
+            }
+        
         # Add any extra state
         checkpoint.update(extra_state)
         
@@ -516,7 +631,11 @@ class BaseTrainerV2(ABC):
         
         Args:
             checkpoint_path: Path to checkpoint file
-            load_optimizer: Whether to load optimizer state
+            load_optimizer: Whether to load optimizer state. Note that the
+                scheduler / scaler / early-stopping state is restored whenever
+                present, independently of this flag: the schedule position is
+                derived from the number of completed epochs (also restored
+                below), not from optimizer state.
             
         Returns:
             Epoch to resume from
@@ -542,17 +661,37 @@ class BaseTrainerV2(ABC):
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self._move_optimizer_to_device(self.optimizer, self.device)
         
-        # Load scheduler if available
+        # Load scheduler if available.
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            try:
+                restore_scheduler_state(
+                    self.scheduler, checkpoint['scheduler_state_dict'],
+                    self.optimizer)
+            except Exception as e:
+                if self.rank == 0:
+                    self.model_logger.warning(
+                        f"Could not restore scheduler state (continuing with a "
+                        f"fresh schedule): {e}"
+                    )
         
         # Load scaler if available
         if 'scaler_state_dict' in checkpoint and self.scaler is not None:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            try:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except Exception as e:
+                if self.rank == 0:
+                    self.model_logger.warning(
+                        f"Could not restore AMP scaler state (continuing with a "
+                        f"fresh scaler): {e}"
+                    )
         
         # Restore best metric
         if 'best_metric' in checkpoint:
             self.best_metric = checkpoint['best_metric']
+        
+        # Restore early-stopping state (patience counter + best score), if
+        # present. Old checkpoints without this key start the window fresh.
+        self._restore_early_stopping_state(checkpoint.get('early_stopping_state'))
         
         start_epoch = checkpoint.get('epoch', 0) + 1
         
@@ -561,6 +700,35 @@ class BaseTrainerV2(ABC):
             self.model_logger.info(f"Resuming from epoch {start_epoch}")
         
         return start_epoch
+    
+    def _restore_early_stopping_state(self, es_state) -> None:
+        """Restore EarlyStoppingV2 state persisted in a checkpoint.
+        
+        Only the mutable state (``best_score``, ``counter``) is restored.
+        ``patience`` / ``min_delta`` / ``mode`` come from the current config,
+        and if they differ from the values saved with the state, restoring
+        would be meaningless (a ``best_score`` from a run with opposite
+        comparison direction is invalid), so the window starts fresh in that
+        case. No-op when the checkpoint predates this state.
+        """
+        if es_state is None or self.early_stopping is None:
+            return
+        es = self.early_stopping
+        if es_state.get('mode') != es.mode or es_state.get('min_delta') != es.min_delta:
+            if self.rank == 0:
+                self.model_logger.warning(
+                    "Saved early-stopping settings (mode/min_delta) differ from the "
+                    "current config — keeping the configured settings and starting "
+                    "the patience counter fresh."
+                )
+            return
+        es.best_score = es_state.get('best_score', es.best_score)
+        es.counter = int(es_state.get('counter', 0))
+        if self.rank == 0:
+            self.model_logger.info(
+                f"Early stopping state restored: best_score={es.best_score}, "
+                f"counter={es.counter}/{es.patience}"
+            )
     
     def _move_optimizer_to_device(self, optimizer, device):
         """Move optimizer state tensors to specified device."""
@@ -758,6 +926,8 @@ class BaseTrainerV2(ABC):
             self._log_bn_freeze_audit()
             # Record exactly which augmentations this run uses
             self._log_augmentation_info(train_loader)
+            # Record the DataLoader worker-seed policy (on/off)
+            self._log_worker_seeding_policy(train_loader)
         
         from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
         
@@ -768,18 +938,34 @@ class BaseTrainerV2(ABC):
         # optimizer steps, and a pre-loop step would shift their whole curve
         # (OneCycleLR already performs its own initial step when constructed).
         if self.scheduler is not None and not is_step_based_scheduler(self.scheduler):
-            # This pre-loop step is intentional legacy behavior to initialize
-            # the LR for epoch 0; step_scheduler() silences the "stepped before
-            # optimizer.step()" warning it triggers.
-            step_scheduler(self.scheduler)
-            if self.rank == 0:
-                self.model_logger.info(
-                    f"Scheduler initial step (pre-loop) — LR: {self.scheduler.get_last_lr()}"
-                )
+            if self.current_epoch == 0:
+                # This pre-loop step is intentional legacy behavior to
+                # initialize the LR for epoch 0; step_scheduler() silences
+                # the "stepped before optimizer.step()" warning it triggers.
+                step_scheduler(self.scheduler)
+                if self.rank == 0:
+                    self.model_logger.info(
+                        f"Scheduler initial step (pre-loop) — LR: {self.scheduler.get_last_lr()}"
+                    )
+            else:
+                # Resumed run: the checkpoint already holds a scheduler state
+                # advanced once per completed epoch. Stepping it again here
+                # would skip one step of the schedule, so the first resumed
+                # epoch trains at the restored LR instead.
+                if self.rank == 0:
+                    self.model_logger.info(
+                        f"Epoch-based scheduler restored from checkpoint (no pre-loop "
+                        f"step) — LR for epoch {self.current_epoch}: "
+                        f"{self.scheduler.get_last_lr()}"
+                    )
         
         try:
             for epoch in range(self.current_epoch, num_epochs):
                 self.current_epoch = epoch
+                
+                # Publish the epoch to the DataLoader workers so they re-seed
+                # their augmentation RNG streams (no-op when the feature is off)
+                self._advance_augmentation_epoch(epoch)
                 
                 # Set epoch for distributed sampler (critical for proper shuffling)
                 if hasattr(train_loader.sampler, 'set_epoch'):
@@ -828,35 +1014,38 @@ class BaseTrainerV2(ABC):
                 if self.rank == 0:
                     self._log_epoch_metrics(epoch, train_metrics, val_metrics)
                 
-                # Check if this is the best model and save checkpoint (rank 0 only)
+                # Track the best val loss (rank 0 only). The checkpoint save is
+                # done at the end of the epoch, after the early-stopping
+                # evaluation, so the persisted state covers the whole epoch.
+                is_best = False
                 if self.rank == 0:
-                    is_best = False
                     if val_loader is not None and val_metrics:
                         current_val_loss = val_metrics.get('loss', float('inf'))
                         if current_val_loss < self.best_metric:
                             self.best_metric = current_val_loss
                             is_best = True
                             self.model_logger.info(f"New best model! Val Loss: {current_val_loss:.4f}")
-                    
-                    # Save checkpoint (prefix keys to avoid collision)
-                    # Always save last_model.pth, and best_model.pth when is_best=True
-                    checkpoint_state = {}
-                    for k, v in train_metrics.items():
-                        checkpoint_state[f'train_{k}'] = v
-                    for k, v in val_metrics.items():
-                        checkpoint_state[f'val_{k}'] = v
-                    self.save_checkpoint(epoch, is_best=is_best, **checkpoint_state)
                 
 
                 from torch.optim.lr_scheduler import ReduceLROnPlateau
                 if self.scheduler is not None:
                     if isinstance(self.scheduler, ReduceLROnPlateau):
-                        if val_loader is not None and val_metrics:
-                            self.scheduler.step(val_metrics.get('loss', float('inf')))
+                        # SSL validation runs on rank 0 only, but every DDP
+                        # rank owns its own scheduler instance — broadcast the
+                        # reduced val loss and let each rank step its own
+                        # scheduler with the identical metric.
+                        if val_loader is not None:
+                            metric = torch.tensor(
+                                [val_metrics.get('loss', float('inf'))],
+                                device=self.device)
+                            if dist.is_initialized():
+                                dist.broadcast(metric, src=0)
+                            self.scheduler.step(float(metric.item()))
                     elif not is_step_based_scheduler(self.scheduler):
                         self.scheduler.step()
                 
                 # Early stopping check - use file-based communication (legacy approach)
+                stop = False
                 if self.early_stopping is not None and val_loader is not None:
                     if self.rank == 0:
                         stop = self.early_stopping(
@@ -869,12 +1058,25 @@ class BaseTrainerV2(ABC):
                             early_stop_file = os.path.join(self.log_dir, '.early_stop_signal')
                             with open(early_stop_file, 'w') as f:
                                 f.write('1')
-                            break
                     else:
                         # Non-rank0: check for early stop signal file
                         early_stop_file = os.path.join(self.log_dir, '.early_stop_signal')
                         if os.path.exists(early_stop_file):
-                            break
+                            stop = True
+                
+                # Save checkpoint (rank 0 only) 
+                if self.rank == 0:
+                    # Save checkpoint (prefix keys to avoid collision)
+                    # Always save last_model.pth, and best_model.pth when is_best=True
+                    checkpoint_state = {}
+                    for k, v in train_metrics.items():
+                        checkpoint_state[f'train_{k}'] = v
+                    for k, v in val_metrics.items():
+                        checkpoint_state[f'val_{k}'] = v
+                    self.save_checkpoint(epoch, is_best=is_best, **checkpoint_state)
+                
+                if stop:
+                    break
         
         except KeyboardInterrupt:
             if self.rank == 0:
@@ -966,6 +1168,139 @@ class BaseTrainerV2(ABC):
             self.tb_logger.log_scalar('learning_rate', current_lr, epoch)
 
 
+def _unwrap_wrapped_dataset(dataset):
+    """Return the dataset at the bottom of any number of ``Subset`` wrappers.
+
+    ``build_ssl_dataset`` and the ``data.subset_percentage`` handling wrap the
+    real dataset in ``torch.utils.data.Subset``, which forwards item access but
+    none of the custom dataset lifecycle hooks (``reseed_augmentation``,
+    ``class_counts``, ``set_epoch``, ...).
+    """
+    seen = set()
+    while True:
+        inner = getattr(dataset, "dataset", None)
+        if inner is None or id(dataset) in seen:
+            return dataset
+        seen.add(id(dataset))
+        dataset = inner
+
+
+def build_worker_init_fn(dataset=None, epoch_counter=None,
+                         epoch_stride=AUG_EPOCH_SEED_STRIDE):
+    """Build the DataLoader ``worker_init_fn`` shared by both training stages
+    (the ON branch of ``train.worker_seeding`` — the "robust" scheme).
+
+    It runs once per worker, right AFTER PyTorch's DataLoader has auto-seeded
+    that worker's torch RNG from a fresh draw of the main process RNG (plus the
+    worker id).  We deliberately do NOT touch the torch generator: that
+    auto-seeded stream is the one that produced the most robust SSL runs.  We
+    only seed what the loader does not manage, with ``torch.initial_seed()``
+    (the auto-seed value — already distinct per worker and per DDP rank, and
+    reproducible across runs with the same ``config.seed``):
+
+      * the module-level ``numpy.random`` / ``random`` generators, which back
+        the fluorescence augmentation and the other numpy/random consumers, and
+      * the image-augmentation RNG object of the training dataset, through
+        :meth:`HDF5Dataset.reseed_augmentation`.
+
+    The second part matters: workers are created with the ``fork`` context (the
+    datasets hold open HDF5 handles), so the ``ImageAugmentation_Generic``
+    object built in the parent with its fixed seed is copied VERBATIM into
+    every worker. Seeding only the module-level generators leaves that object
+    at the same state everywhere, so all workers replay the identical
+    rotation/translation sequence: the k-th image of worker 0 and of worker 1
+    get the same angle. Because the DataLoader assigns sample *i* to worker
+    ``i % num_workers``, that makes one batch share a handful of angles and
+    divides the effective geometric diversity by ``num_workers``.
+
+    The per-epoch part: the training loader runs with ``persistent_workers=True``,
+    so this function is evaluated ONCE per worker and the epoch cannot be read
+    at spawn time alone.  The shared counter (created by the stage workers,
+    written by the trainer at the top of every epoch) is therefore handed to the
+    dataset (:meth:`HDF5Dataset.attach_augmentation_epoch`), which refreshes the
+    numpy/random/aug-RNGs at ``auto_seed + epoch * epoch_stride`` whenever the
+    trainer publishes a new epoch (:meth:`HDF5Dataset._sync_augmentation_epoch`)
+    — the worker's torch RNG still keeps its auto-seed for the whole run.
+
+    Args:
+        dataset: the training dataset. Only used as a fallback when the hook
+            cannot be resolved from the running worker (``num_workers=0``, where
+            this function is never called anyway); inside a worker the dataset
+            is taken from ``torch.utils.data.get_worker_info()``, which is the
+            dataset the worker ACTUALLY iterates — identity with a parent-side
+            object is not guaranteed (and would not hold at all under a
+            spawn/forkserver start method). ``None``, or a dataset without
+            ``reseed_augmentation``, leaves the fork-duplicated state in place.
+
+        epoch_counter: shared epoch counter (see
+            :func:`~bioairmet.data.datasets_cls.make_augmentation_epoch_counter`)
+            that the trainer advances every epoch, or ``None`` to disable the
+            per-epoch refresh of the non-torch streams.
+        epoch_stride: per-epoch seed offset
+            (:data:`~bioairmet.data.datasets_cls.AUG_EPOCH_SEED_STRIDE`).
+
+    Returns:
+        callable(worker_id) for ``DataLoader(worker_init_fn=...)``.
+    """
+    def _worker_init_fn(worker_id):
+        # PyTorch's DataLoader auto-seeded this worker's torch RNG just before
+        # calling us; keep that value (distinct per worker and rank, and
+        # reproducible across runs) and seed only the generators the loader
+        # does not manage.
+        auto_seed = torch.initial_seed()
+        seed_worker_rngs(auto_seed, include_torch=False)
+
+        # Re-seed the augmentation RNG this process inherited through fork.
+        # The dataset is resolved from the worker info (with Subset wrappers
+        # unwrapped), not from `dataset`, so the object being re-seeded is the
+        # one this worker really uses.
+        info = torch.utils.data.get_worker_info()
+        target = info.dataset if info is not None else dataset
+        if target is not None:
+            target = _unwrap_wrapped_dataset(target)
+            reseed = getattr(target, "reseed_augmentation", None)
+            if callable(reseed):
+                reseed(auto_seed)
+            # persistent_workers=True means this function never runs again, so
+            # the epoch has to reach the worker through shared memory: keep the
+            # counter plus this worker's base seed on the dataset and let it
+            # re-seed itself at the first sample fetched after an epoch
+            # boundary (never touching the torch RNG).
+            attach = getattr(target, "attach_augmentation_epoch", None)
+            if callable(attach) and epoch_counter is not None:
+                attach(epoch_counter, auto_seed, epoch_stride, 0)
+
+    return _worker_init_fn
+
+
+def worker_seeding_enabled(config):
+    """Resolve the single on/off switch ``train.worker_seeding`` (default ON).
+
+    ON  (robust scheme): the worker ``worker_init_fn`` keeps PyTorch's
+        auto-seeded worker torch RNG untouched and seeds the numpy/random and
+        augmentation RNGs with ``torch.initial_seed()`` (distinct per worker
+        and per DDP rank, reproducible across runs), refreshing those non-torch
+        streams at the start of every epoch (``+ epoch * 100003``).
+    OFF: no ``worker_init_fn`` at all — we seed nothing (PyTorch still
+        auto-seeds the worker torch RNG; the numpy/random/aug-RNGs keep the
+        fork-duplicated state).  Use this for the bare "no reproducibility"
+        experiments.
+
+    The legacy key ``train.vary_augmentation_seed_per_epoch`` (previous
+    iteration of this feature) is honoured as a fallback when the new key is
+    absent, so existing configs keep a defined behaviour.
+
+    Returns:
+        bool.
+    """
+    train = config.train
+    if 'worker_seeding' in train:
+        return bool(train['worker_seeding'])
+    if 'vary_augmentation_seed_per_epoch' in train:
+        return bool(train['vary_augmentation_seed_per_epoch'])
+    return True
+
+
 def build_stage_dataloaders(
     config,
     train_dataset,
@@ -1028,7 +1363,7 @@ def build_stage_dataloaders(
             sampler=sampler,
             pin_memory=True,
             drop_last=drop_last,
-            persistent_workers=persistent and num_workers > 0,
+            persistent_workers=True ,#persistent and num_workers > 0,
             multiprocessing_context='fork' if num_workers > 0 else None,
             worker_init_fn=worker_init_fn,
         )

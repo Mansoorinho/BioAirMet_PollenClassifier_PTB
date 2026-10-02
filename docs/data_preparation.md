@@ -76,8 +76,16 @@ them, so alternatively named files also work:
 | `image_column_name` | `images` |
 | `fluorescence_spectra_column_name` | `relative_spectra` |
 | `category_number_column_name` | `category_num` |
-| `category_string_column_name` | `category` |
-| `img_count_per_sample` | `1` (set `2` when `images` holds a pair per row) |
+
+A row of the image column may hold a **single** path or a **pair** of paths (two
+views of the same event); the loaders detect which from the row content, so
+there is no "images per sample" switch. `data.stitch_images` then decides how a
+pair is used: stitched side by side into one wide image (the layout Stage 1 must
+have been trained with) or returned as two separate views.
+
+Labels come from `category_number_column_name` together with `data.cat_map_path`.
+A string `category` column may live in the file for your own inspection, but no
+trainer reads it.
 
 > **Consistency across stages matters more than the names**: Stage 2 is locked
 > to the architecture the SSL weights were trained with (the SSL bundle's

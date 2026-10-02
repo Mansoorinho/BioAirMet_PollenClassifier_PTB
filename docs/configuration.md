@@ -520,6 +520,42 @@ train:
     momentum: 0.9
 ```
 
+## Gradient clipping & regularization
+
+Two independent switches under `train:`, both applied after `backward()` and
+before `optimizer.step()`:
+
+```yaml
+train:
+  gradient_clipping:
+    enable: True
+    clipping_mode: "fixed"      # "adaptive" (1/AMP-scale) | "fixed"
+    clip_value: 1.0
+  gradient_regularization:
+    enable: False               # same flag name in BOTH stages
+    norm_mode: "gradient_noise" # "gradient_noise" | "l2_norm" | "linf_norm" | "step_scaling" | "img_encoder_grad_down_scaling"
+    noise_std: 0.00001          # used by "gradient_noise"
+    max_norm: 1.0               # used by "l2_norm"
+    grad_scale: 0.0001          # used by "step_scaling"
+    imgEnc_grad_scale: 0.1      # used by "img_encoder_grad_down_scaling"
+```
+
+`img_encoder_grad_down_scaling` multiplies the gradient of every parameter under
+the image encoder (`img_encoder.*`, the DDP `module.` prefix included) by
+`imgEnc_grad_scale`, in both stages. With the default **frozen** image encoder
+there are no encoder gradients to scale, so the run logs one warning saying the
+mode had no effect — to slow a (partly) unfrozen encoder down prefer
+`train.fine_tuning.image_encoder_lr_multiplier`, which changes the learning rate
+instead of the gradient.
+
+> **Behaviour note:** the classification stage used to read this flag as
+> `gradient_regularization.enabled` (the shipped key is `enable`), which made
+> the whole block inert there, and the SSL stage matched the encoder on the name
+> `image_encoder` while the models call it `img_encoder`, so
+> `img_encoder_grad_down_scaling` left every gradient untouched. A config that
+> already sets `gradient_regularization.enable: true` now really gets the
+> regularization it asks for, so such runs are not comparable with older ones.
+
 ---
 
 ## Learning-rate schedulers
@@ -661,6 +697,16 @@ in code** and therefore opt-in per experiment:
 | `cudnn_benchmark` | `False` | Lets cuDNN auto-tune convolution algorithms per input shape. Worth it because every step here uses the same fixed `data.image_size`; the price is a slower first pass (and re-tuning if shapes vary, e.g. multi-resolution). |
 | `tf32` | `False` | Enables TF32 for fp32 matmul/conv on Ampere and newer. Consistent with `mixed_precision: True`; turn it off when you need the full fp32 mantissa. |
 | `channels_last` | `False` | Converts the models and the image batches to NHWC (`memory_format=torch.channels_last`). Biggest single win for these conv nets. |
+
+A separate `train:` key controls the RNG streams rather than the speed:
+`worker_seeding` (default `True`) is the master on/off switch. ON = the robust
+scheme: each worker's torch RNG keeps PyTorch's auto-seed (the stream that gave
+the most robust SSL runs) while the `random`/`numpy`/augmentation RNGs are
+seeded per worker (`torch.initial_seed()` based) and refreshed every epoch
+(`+epoch*100003`). OFF = no `worker_init_fn` at all (PyTorch still auto-seeds the
+worker torch RNG; the other streams keep the fork-duplicated state).
+`num_workers: 0` is unaffected either way; see *DataLoader worker seeding* in
+`docs/training.md`.
 
 Measured during development on this project's backbones (batch 64, 200×200,
 forward **and** backward, RTX PRO 6000 Blackwell):

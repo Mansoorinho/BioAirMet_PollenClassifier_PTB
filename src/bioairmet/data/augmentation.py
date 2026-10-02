@@ -1093,6 +1093,41 @@ class ImageAugmentation_Generic:
         """Problems found in the ``image_transforms`` block (custom mode)."""
         return list(self._config_warnings)
 
+    # -------------------------
+    # Worker-process seeding
+    # -------------------------
+    def reseed_for_worker(self, seed: int) -> None:
+        """Re-seed the augmentation RNG inside a DataLoader worker process.
+
+        ``_FlipOp`` (custom mode) and ``_AffineOp`` (rotation / translation,
+        also used by the legacy classification pipeline) draw their randomness
+        from the SINGLE ``random.Random`` instance created in ``__init__``
+        (``seed=seed``).  DataLoader workers are created with ``fork``, so every
+        worker starts with an exact copy of that object at the same state:
+        unless it is re-seeded *inside* the worker, all workers replay the
+        identical stream - the k-th image handled by worker 0 gets the same
+        rotation angle as the k-th image handled by worker 1 - which cuts the
+        effective diversity of the geometric augmentation by a factor of
+        ``num_workers`` and ties the drawn angles to the batch layout
+        (sample *i* is fetched by worker *i % num_workers*).
+
+        The module-level ``random`` / ``numpy.random`` / ``torch`` generators
+        are NOT affected by this: the trainers' ``worker_init_fn`` already
+        re-seeds those, which is why the torch-RNG based transforms (the flips
+        of the legacy pipelines, colour jitter, blur, noise, cutout, the
+        ``img_aug_prob`` gate) do vary across workers.
+
+        The RNG is re-seeded IN PLACE on purpose: the ops keep a reference to
+        this very object, so assigning a new ``random.Random`` here would leave
+        them drawing from the old, duplicated stream.
+
+        Args:
+            seed: per-worker seed. Must differ between workers; the trainers
+                use ``config.seed + rank + worker_id`` (see
+                ``build_worker_init_fn`` in ``trainers/base_trainer_v2.py``).
+        """
+        self._rng.seed(int(seed))
+
     def effective_prob(self, p: Optional[float]) -> Optional[float]:
         """Probability of a transform actually running, including the gate.
 

@@ -74,6 +74,8 @@ nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.2.75
 nvidia-nvtx-cu11==11.8.86
 nvidia-nvtx-cu12==12.8.90
+onnx==1.23.0
+onnxruntime==1.30.0
 packaging==26.2
 pandas==3.0.3
 pillow==12.2.0

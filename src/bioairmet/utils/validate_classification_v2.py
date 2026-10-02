@@ -35,7 +35,7 @@ import gc
 from ..utils.config_parser import parse_config, load_experiment_config
 from ..models import build_model_from_config
 from ..models._common import strip_ddp_prefix, ensure_state_dict_metadata
-from ..data.datasets_cls import Stage2Dataset
+from ..data.datasets_cls import Stage2Dataset, image_reader_kwargs
 from ..utils.classification_losses import build_classification_loss_from_config
 from ..utils.metrics import AverageMeter, accuracy
 from ..utils.plots import plot_confusion_matrix, get_sorted_confusion_matrix
@@ -152,10 +152,18 @@ def prepare_model_for_validation(model: nn.Module, logger: logging.Logger) -> nn
     for param in model.parameters():
         param.requires_grad = False
     
-    # Force BatchNorm to use stored statistics
-    for module in model.modules():
-        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            module.track_running_stats = False
+    bn_modules = [m for m in model.modules()
+                  if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
+    if bn_modules:
+        n_train = sum(1 for m in bn_modules if m.training)
+        n_track = sum(1 for m in bn_modules if getattr(m, 'track_running_stats', True))
+        if n_train:
+            logger.warning(
+                f"{n_train}/{len(bn_modules)} BatchNorm layer(s) are still in train mode "
+                f"after eval() - validation would normalise with batch statistics")
+        logger.info(f"BatchNorm: {len(bn_modules)} layer(s) in eval mode, "
+                    f"{n_track}/{len(bn_modules)} tracking running statistics "
+                    f"(stored statistics used for normalisation)")
     
     # Log parameter summary
     total_params = sum(p.numel() for p in model.parameters())
@@ -256,6 +264,12 @@ def validate_classification_model_v2(
         print(f"Using category map from: {cat_map_path}")
     else:
         print("Warning: category map not found; plots will use generic Class_0, Class_1, ... labels")
+    # Build the validation dataset.
+    # Mirror the training-time dataset construction exactly
+    try:
+        head_num_classes = int(config.architecture_setup.classification_model.num_classes)
+    except Exception:
+        head_num_classes = None
     val_dataset = Stage2Dataset(
         hdf5_path=data_path,
         image_key=config.data.get('image_column_name', 'images'),
@@ -265,6 +279,8 @@ def validate_classification_model_v2(
         img_aug_prob=0.0,  # No augmentation
         fluo_aug_prob=0.0,
         cat_map_path=cat_map_path,
+        num_classes=head_num_classes,
+        **image_reader_kwargs(config.data),
     )
     
     logger.info(f"Dataset loaded: {len(val_dataset)} samples")

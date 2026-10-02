@@ -61,6 +61,12 @@ dev = [
 wandb = [
     "wandb>=0.15.0",
 ]
+# ONNX export/consumption of trained classifiers (not needed for
+# training or the PyTorch inference path).
+onnx = [
+    "onnx>=1.16.0",
+    "onnxruntime>=1.17.0",
+]
 
 [project.urls]
 Homepage = "https://www.bioairmet.ptb.de/home"

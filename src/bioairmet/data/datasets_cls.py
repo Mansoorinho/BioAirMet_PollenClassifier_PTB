@@ -1,7 +1,7 @@
 '''
 @file    :   datasets_cls.py
 @create date : 2026-01-25 10:07:49
-@modify date 2026-04-29 15:09:00
+@modify date 2026-09-29 15:09:00
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -253,6 +253,20 @@ class _BaseImageReader:
       ``supports_pairs = True`` (``ImageAugmentation_Generic``) receive the two
       views of a pair in ONE call (so shared pair geometry works); every other
       callable is applied to each image independently.
+
+    ALL readers ('legacy', 'minmax', 'global') follow the same
+    read -> resize -> augment -> normalize order:
+
+    * **Resize**: an image that is already ``img_size x img_size`` is NEVER
+      resized - 200x200 is the native size of the corpus, so with the usual
+      config ``data.image_size: 200`` no resize work happens at all. Only an
+      off-size image is resized bilinearly to ``(img_size, img_size)``,
+      before augmentation, with a one-time warning.
+    * **Normalization**: ``data.image_normalization`` (``img_mean`` / ``img_std``)
+      is applied LAST (after augmentation, so augmentation always works on the
+      [0, 1] image) and ONLY when it is enabled via the config file -
+      ``image_reader_kwargs`` wires ``img_mean``/``img_std`` into the reader
+      only when ``data.image_normalization.enable`` is true.
     """
 
     def __init__(self, p: float = 0.5, augmentation=None, img_size: int = 200,
@@ -293,7 +307,12 @@ class _BaseImageReader:
 class LegacyMinMaxImageReader(_BaseImageReader):
     """
     Flexible image reader for 1 or 2 grayscale images with minmax normalization to 8-bit.
-    Supports augmentation and optional normalization.
+
+    Pipeline (same order as :class:`New_Image_reader`): minmax -> 8-bit PIL
+    -> resize to ``(img_size, img_size)`` ONLY if the image is not already at
+    that size (200x200 is the native size of the corpus, so normally no resize
+    happens) -> augmentation -> ``ToTensor`` -> ``data.image_normalization``
+    (applied last, only when enabled via the config file).
     """
 
     def __init__(self, p: float = 0.5, augmentation=None, img_size: int = 200,
@@ -301,22 +320,46 @@ class LegacyMinMaxImageReader(_BaseImageReader):
                  stitch: bool = False):
         super().__init__(p=p, augmentation=augmentation, img_size=img_size,
                          img_mean=img_mean, img_std=img_std, stitch=stitch)
+        self._size_warned = False
 
-        # Base transform: PIL -> tensor
+        # Base transform: PIL -> tensor.  The resize is NOT part of this
+        # compose: it happens explicitly in ``_read_image`` (``_resize_if_needed``)
+        # BEFORE augmentation, and is skipped entirely when the image is
+        # already ``img_size x img_size``.
         self.base_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
         ])
 
-        # Add normalization if provided
+        # ``data.image_normalization`` is wired in (img_mean/img_std) only when
+        # the config enables it - see image_reader_kwargs.  Applied LAST, after
+        # augmentation, so the augmentation works on [0, 1] values.
         if img_mean is not None and img_std is not None:
             self.base_transform = transforms.Compose([
                 self.base_transform,
                 transforms.Normalize(mean=[img_mean], std=[img_std])
             ])
 
+    def _resize_if_needed(self, pil_img: Image.Image, img_path: Optional[str] = None) -> Image.Image:
+        """Bilinearly resize to ``(img_size, img_size)`` ONLY if off-size.
+
+        An image already at the config ``image_size`` (200x200 is the native
+        size of the corpus) passes through untouched - no resize work is done.
+        """
+        if pil_img.size == (self.img_size, self.img_size):
+            return pil_img
+        if not self._size_warned:
+            what = img_path if img_path is not None else f"image {pil_img.size}"
+            print(
+                f"Warning: {what} is {pil_img.size} but "
+                f"data.image_size={self.img_size}; resizing (warned once per loader)."
+            )
+            self._size_warned = True
+        return pil_img.resize((self.img_size, self.img_size), Image.Resampling.BILINEAR)
+
     def _read_image(self, img_path: str) -> Image.Image:
-        """Minmax normalize 16-bit -> 8-bit grayscale PIL Image."""
+        """Minmax normalize 16-bit -> 8-bit grayscale PIL Image, at
+        ``(img_size, img_size)`` (resized bilinearly only if the file is not
+        already at the config ``image_size`` - 200x200 is the native size)."""
         try:
             pil_img = Image.open(img_path)
             img_array = np.array(pil_img, dtype=np.float32)
@@ -335,7 +378,7 @@ class LegacyMinMaxImageReader(_BaseImageReader):
 
             normalized_img = Image.fromarray(img_array, mode='L')
             pil_img.close()
-            return normalized_img
+            return self._resize_if_needed(normalized_img, img_path)
 
         except FileNotFoundError:
             raise FileNotFoundError(f"Image not found: {img_path}")
@@ -392,7 +435,12 @@ class New_Image_reader(_BaseImageReader):
         self._size_warned = False
 
     def _to_tensor(self, img_path: str) -> torch.Tensor:
-        """Read + normalize an image to a (1, img_size, img_size) float tensor."""
+        """Read + normalize an image to a (1, img_size, img_size) float tensor.
+
+        An image already at ``img_size`` (200x200 is the native size of the
+        corpus) passes through untouched - no resize work is done. Only an
+        off-size image is resized bilinearly (one-time warning).
+        """
         img_array = read_image_norm_new(img_path, method=self.method,
                                         img_size=self.img_size)
         tensor = torch.from_numpy(
@@ -415,10 +463,12 @@ class New_Image_reader(_BaseImageReader):
     def _normalize(self, tensor: torch.Tensor) -> torch.Tensor:
         """Apply ``data.image_normalization`` (mean/std) AFTER augmentation.
 
-        :class:`LegacyMinMaxImageReader` has always done this (``ToTensor`` then
-        ``Normalize``), but this reader accepted ``img_mean``/``img_std`` and
-        silently ignored them, so enabling image normalization changed nothing
-        for 'minmax'/'global'.  It is applied last, so the augmentations (and their
+        The mean/std reach the reader ONLY when the config file enables them
+        (``data.image_normalization.enable: true`` - see
+        ``image_reader_kwargs``); otherwise this is a no-op and the output
+        stays in [0, 1].  :class:`LegacyMinMaxImageReader` applies the same
+        normalization at the same stage (``ToTensor`` then ``Normalize``).
+        It is applied last, so the augmentations (and their
         white fill) always work on the [0, 1] image.
         """
         if self.img_mean is None or self.img_std is None:
@@ -446,6 +496,96 @@ class New_Image_reader(_BaseImageReader):
                     else (img1_tensor, img2_tensor)) # type: ignore
 
         raise TypeError(f"Expected str or (str,str), got {type(img_input)}")
+
+
+#: Offset added to the worker seed per epoch.  A large prime keeps the streams
+#: of consecutive epochs from overlapping (a plain ``+1`` would make epoch N+1
+#: of worker w replay almost the same numbers as epoch N of worker w+1).
+AUG_EPOCH_SEED_STRIDE = 100_003
+
+#: NumPy's legacy seed ceiling (``random.seed``/``torch.manual_seed`` accept
+#: more, but keeping every seed < 2**31 makes the three generators comparable
+#: and the arithmetic overflow-free).
+_RNG_SEED_MAX = 2 ** 31 - 1
+
+
+def worker_augmentation_seed(worker_base, epoch=0, stride=AUG_EPOCH_SEED_STRIDE):
+    """Augmentation-RNG seed of one worker in one epoch.
+
+    ``worker_base`` is the seed PyTorch itself gave this worker's torch RNG
+    (``torch.initial_seed()`` inside the worker — a fresh draw of the main
+    process RNG plus the worker id, so it is already distinct per worker and per
+    DDP rank, and reproducible across runs with the same ``config.seed``).
+    Folding the epoch in with the large prime stride keeps every epoch's
+    augmentation stream distinct; ``epoch = 0`` is the spawn-time seed itself.
+
+    Returns:
+        int in ``[0, 2**31)``.
+    """
+    return (int(worker_base) + int(epoch) * int(stride)) % _RNG_SEED_MAX
+
+
+def seed_worker_rngs(seed, include_torch: bool = True):
+    """Seed this process' module-level ``random``/``numpy`` (and optionally ``torch``).
+
+    Used by :func:`build_worker_init_fn` at worker startup and by
+    :meth:`HDF5Dataset._sync_augmentation_epoch` when the epoch advances.  The
+    augmentation pipeline's own RNG object is NOT touched here — that needs
+    :meth:`HDF5Dataset.reseed_augmentation`.
+
+    ``include_torch=False`` is the robust worker-seeding mode: the worker's
+    torch RNG keeps the seed PyTorch's DataLoader auto-applied (that auto-seeded
+    stream gave the most robust SSL runs — see ``build_worker_init_fn`` in
+    ``trainers/base_trainer_v2.py``).
+
+    Returns:
+        int: the seed actually applied (wrapped into ``[0, 2**31)``).
+    """
+    seed = int(seed) % _RNG_SEED_MAX
+    random.seed(seed)
+    np.random.seed(seed)
+    if include_torch:
+        torch.manual_seed(seed)
+    return seed
+
+
+def make_augmentation_epoch_counter():
+    """Create the process-shared epoch counter for per-epoch worker re-seeding.
+
+    The DataLoader workers are created with ``fork``, so a
+    ``multiprocessing.Value`` handed to them (through the ``worker_init_fn``
+    closure) shares memory with the parent: when the trainer writes the current
+    epoch into it, every worker notices on the next sample it fetches and
+    re-seeds itself (see :meth:`HDF5Dataset._sync_augmentation_epoch`).  This
+    is what makes the epoch visible to workers that were spawned ONCE, i.e.
+    when the train loader runs with ``persistent_workers=True``.
+
+    Returns:
+        multiprocessing.sharedctypes value initialised to ``0``, or ``None``
+        when shared memory is unavailable (the feature then stays off).
+    """
+    try:
+        import ctypes
+        import multiprocessing as mp
+        return mp.Value(ctypes.c_long, 0)
+    except Exception as e:  # pragma: no cover - only on platforms without /dev/shm
+        logger.warning(f"Could not create the augmentation epoch counter "
+                       f"(per-epoch worker re-seeding disabled): {e}")
+        return None
+
+
+def set_augmentation_epoch(counter, epoch):
+    """Publish the current epoch to the DataLoader workers.
+
+    Safe no-op for ``counter=None`` (feature disabled) and for a counter that
+    cannot be written (e.g. accessed from a process that did not inherit it).
+    """
+    if counter is None:
+        return
+    try:
+        counter.value = int(epoch)
+    except Exception:
+        pass
 
 
 class HDF5Dataset(Dataset):
@@ -574,6 +714,16 @@ class HDF5Dataset(Dataset):
             style=fl_aug_type, prob=fluo_aug_prob, std=fluo_pca_std,
             styles=unlabeled_stats)
         self.epoch = 0
+
+        # --- Per-epoch augmentation re-seeding state (worker-side) ----------
+        # Populated by build_worker_init_fn -> attach_augmentation_epoch() when
+        # train.worker_seeding is on; the worker then refreshes the
+        # numpy/random/aug-RNGs whenever the trainer advances the shared epoch
+        # counter (see _sync_augmentation_epoch).  The worker torch RNG is
+        # NEVER touched.  All None => the feature is off.
+        self._aug_epoch_counter = None
+        self._aug_seed_params = None      # (worker_base, stride)
+        self._aug_epoch_synced = None     # epoch the RNGs currently match
 
         # --- HDF5 Initialization Logic ---
         # Calculate length ONCE in main process to prevent thundering herd
@@ -787,6 +937,89 @@ class HDF5Dataset(Dataset):
         # if (epoch > 0 and epoch % 10 == 0):
         #     self._close_hdf5()  # Will be reopened on next access
 
+    def reseed_augmentation(self, seed: int) -> None:
+        """Re-seed the image-augmentation RNG of THIS DataLoader worker process.
+
+        Called from the trainers' ``worker_init_fn`` — see
+        :func:`build_worker_init_fn` in ``trainers/base_trainer_v2.py``.
+
+        DataLoader workers are created with ``fork``, so the
+        ``ImageAugmentation_Generic`` object that was built in the parent (with
+        the fixed ``data.augmentation`` seed) is copied verbatim into every
+        worker. Re-seeding only the module-level ``random``/``numpy``/``torch``
+        generators therefore leaves the augmentation's own RNG — the one the
+        rotation/translation (and custom-mode flip) ops draw from — at the same
+        state in all workers, so every worker replays the same geometric
+        augmentation sequence. This call removes that duplication.
+
+        Safe no-op when the augmentation object does not expose the hook (any
+        plain callable transform); the validation datasets run with
+        ``img_aug_prob = 0`` and are never augmented at all.
+        """
+        reseed = getattr(self.transform, "reseed_for_worker", None)
+        if callable(reseed):
+            reseed(seed)
+
+    def attach_augmentation_epoch(self, counter, worker_base,
+                                  stride=AUG_EPOCH_SEED_STRIDE, epoch=0):
+        """Enable per-epoch refresh of THIS worker's non-torch RNG streams.
+
+        Called from the trainers' ``worker_init_fn`` right after
+        :meth:`reseed_augmentation`.  It is needed because the training
+        DataLoader runs with ``persistent_workers=True``: the workers are
+        forked ONCE, so ``worker_init_fn`` is evaluated only at the start of the
+        run.  Keeping the shared epoch counter (created by
+        :func:`make_augmentation_epoch_counter`, written by the trainer at the
+        top of every epoch) plus this worker's base seed here lets the worker
+        recompute its augmentation seed for the current epoch inside
+        :meth:`_sync_augmentation_epoch`.  The worker's torch RNG is never
+        re-seeded (robust worker-seeding mode).
+
+        Args:
+            counter: shared epoch counter, or ``None`` to leave the feature off.
+            worker_base: the seed PyTorch auto-applied to this worker's torch
+                RNG (``torch.initial_seed()`` — already distinct per worker and
+                per DDP rank, reproducible across runs).
+            stride: per-epoch seed offset (:data:`AUG_EPOCH_SEED_STRIDE`).
+            epoch: epoch the RNGs are currently seeded for.
+        """
+        self._aug_epoch_counter = counter
+        self._aug_seed_params = (int(worker_base), int(stride))
+        self._aug_epoch_synced = int(epoch)
+
+    def _sync_augmentation_epoch(self):
+        """Re-seed this worker's non-torch RNGs when the epoch advanced.
+
+        Cheap by design: one shared-memory read plus one integer comparison per
+        sample; the re-seeding itself happens once per worker per epoch.  No-op
+        when the feature is off (``counter is None`` — which is also the case in
+        the parent process, since ``num_workers: 0`` never calls
+        ``worker_init_fn`` and ``train.worker_seeding: false`` never attaches a
+        counter).  The worker's torch RNG is deliberately left alone: it keeps
+        the PyTorch auto-seed for the whole run.
+
+        Samples already in the prefetch queue when the epoch advances keep the
+        previous epoch's stream; only samples fetched afterwards draw from the
+        new one.  That is harmless (both are equally random) but means the
+        exact stream depends on ``num_workers`` / prefetch depth.
+        """
+        counter = getattr(self, '_aug_epoch_counter', None)
+        if counter is None:
+            return
+        try:
+            epoch = int(counter.value)
+        except Exception:
+            return
+        if epoch == getattr(self, '_aug_epoch_synced', None):
+            return
+        self._aug_epoch_synced = epoch
+        worker_base, stride = self._aug_seed_params
+        seed = seed_worker_rngs(worker_augmentation_seed(worker_base, epoch,
+                                                         stride),
+                                include_torch=False)
+        self.reseed_augmentation(seed)
+
+
 class Stage1Dataset(HDF5Dataset):
     """
     Upgraded Dataset for Stage 1: Self-Supervised Learning.
@@ -807,6 +1040,9 @@ class Stage1Dataset(HDF5Dataset):
         super().__init__(return_labels=False, **kwargs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # Re-seed this worker when the epoch changed (no-op unless the trainer
+        # attached the shared epoch counter — see attach_augmentation_epoch).
+        self._sync_augmentation_epoch()
         f = self._get_hdf5_handle()
 
         # Load Raw Data (Paths from HDF5)
@@ -947,6 +1183,9 @@ class Stage2Dataset(HDF5Dataset):
         return category_mapping if category_mapping else None
 
     def __getitem__(self, idx: int) -> Dict[str, Union[tuple, torch.Tensor, int]]:
+        # Re-seed this worker when the epoch changed (no-op unless the trainer
+        # attached the shared epoch counter — see attach_augmentation_epoch).
+        self._sync_augmentation_epoch()
         f = self._get_hdf5_handle()
         # Map dataset-local index to the underlying HDF5 index if we pre-filtered
         real_idx = self._valid_indices[idx] if (hasattr(self, '_valid_indices') and self._valid_indices is not None) else idx
@@ -1239,20 +1478,43 @@ def image_reader_kwargs(cfg) -> dict:
     Only non-default values are returned so callers can conditionally pass
     them through (a dataset may reject an option it does not support, e.g.
     ``stitch_images`` for two-image classification data).
+
+    ``image_normalization`` is honoured ONLY when its ``enable`` flag is
+    truthy: a config that lists ``img_mean``/``img_std`` but keeps
+    ``enable: false`` (or omits the block) yields plain [0, 1] images.
+    Enabling it without both ``img_mean`` and ``img_std`` fails fast.
     """
     def _scalar(value):
         if value is None:
             return None
-        try:
+        if isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) == 0:
+                raise ValueError(
+                    "data.image_normalization img_mean/img_std must contain "
+                    "at least one value")
             return float(value[0])
-        except (IndexError, TypeError):
-            return float(value)
+        return float(value)
 
     out = {'image_size': int(cfg.get('image_size', 200) or 200)}
-    norm = cfg.get('image_normalization') or {}
+    norm = cfg.get('image_normalization')
+    if norm is None:
+        norm = {}
+    elif isinstance(norm, bool):
+        norm = {'enable': norm}
+    if not isinstance(norm, dict):
+        raise ValueError(
+            "data.image_normalization must be a mapping with 'enable', "
+            f"'img_mean' and 'img_std' - got {type(norm).__name__}: {norm!r}")
     if norm.get('enable'):
-        out['img_mean'] = _scalar(norm.get('img_mean'))
-        out['img_std'] = _scalar(norm.get('img_std'))
+        img_mean = _scalar(norm.get('img_mean'))
+        img_std = _scalar(norm.get('img_std'))
+        if img_mean is None or img_std is None:
+            raise ValueError(
+                "data.image_normalization.enable is true but img_mean and "
+                "img_std are not both set - provide both (e.g. "
+                "img_mean: [0.5], img_std: [0.5]) or disable the block.")
+        out['img_mean'] = img_mean
+        out['img_std'] = img_std
     if cfg.get('stitch_images', False):
         out['stitch_images'] = True
     return out
@@ -1517,6 +1779,20 @@ def build_classification_dataset(config):
         unlabeled_stats=None,
         num_classes=head_num_classes
     )
+
+    # Apply data.subset_percentage (default 1.0 = no subsetting) to both
+    # splits — the same documented semantics the SSL stage honours: the first
+    # int(total * percentage) samples of each split are kept (deterministic,
+    # identical on every rank).
+    subset_percentage = cfg.get('subset_percentage', 1.0)
+    if subset_percentage is not None and subset_percentage < 1.0:
+        from torch.utils.data import Subset
+        train_len = int(len(train_dataset) * subset_percentage)
+        val_len = int(len(val_dataset) * subset_percentage) if val_dataset is not None else 0
+        train_dataset = Subset(train_dataset, list(range(train_len)))
+        if val_dataset is not None:
+            val_dataset = Subset(val_dataset, list(range(val_len)))
+        print(f"Using Subset ({subset_percentage * 100}%): train={train_len}, val={val_len}")
 
     return train_dataset, val_dataset
 

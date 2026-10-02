@@ -53,11 +53,11 @@ data:
   subset_percentage: 1.0
 
   # --- ADVANCED ------------------------------------------------------------
-  # change between 1 or 2 images per sample, if 2, both images will be used
-  # for SSL training; the h5 file must contain a list of two image paths
-  # for each sample
-  img_count_per_sample: 1 # number of images per sample/event
-  # name of the image column in the h5 file (see img_count_per_sample=2 note)
+  # name of the image column in the h5 file. A row may hold ONE image path or a
+  # pair of paths (two views of the same event): the loader detects which from
+  # the row content, there is no count to configure. A pair is stitched side by
+  # side into one wide image when stitch_images is true, and returned as two
+  # separate views otherwise.
   image_column_name: "images"
   # name of the fluorescence spectra column in the h5 file; relative_spectra
   # is already extracted from the json file in (3, 5) shape
@@ -72,7 +72,7 @@ data:
   image_size: 200 # square image size (height and width)
   # ---- If True, the two images are stitched to make one and used for training and testing ----
   # To be used as the pre-trained weight for the next stage, this should also
-  # be True in the classification stage.
+  # be True in the classification stage. TO BE IMPLEMENTED. 
   stitch_images: False
 
   img_reader_type: 'legacy' # Options: 'legacy' | 'minmax' | 'global'
@@ -236,6 +236,23 @@ train:
   channels_last: False # NHWC memory format for model + inputs (biggest win on these
                        # small conv nets, see numbers above). Left off by default so
                        # results stay comparable with previous NCHW runs.
+
+  # --- DATALOADER RNG STREAMS -------------------------------------------------
+  worker_seeding: True # Master on/off switch for worker RNG seeding.
+                       # True  = robust scheme: each worker's torch RNG keeps
+                       #         PyTorch's auto-seed (the stream that gave the
+                       #         most robust SSL runs); the random/numpy and
+                       #         augmentation RNGs are seeded per worker
+                       #         (torch.initial_seed() based) and refreshed
+                       #         every epoch (+epoch*100003).
+                       # False = no worker_init_fn at all: nothing is seeded by
+                       #         us (PyTorch still auto-seeds the worker torch
+                       #         RNG); random/numpy/aug-RNGs keep the
+                       #         fork-duplicated state. Bare "no reproducibility"
+                       #         experiments.
+                       # num_workers: 0 is unaffected either way.
+                       # The SSL legacy pipeline has no affine op, so the visible
+                       # effect there is limited to the torch-RNG transforms.
 
   gradient_clipping:
     enable: True # Set to True to enable gradient clipping

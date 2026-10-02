@@ -103,6 +103,98 @@ def is_epoch_based_scheduler(scheduler) -> bool:
     return not is_step_based_scheduler(scheduler)
 
 
+# ---------------------------------------------------------------------------
+# Scheduler state restoration (resume) — single source of truth
+# ---------------------------------------------------------------------------
+# A scheduler's ``state_dict()`` (torch >= 2.x) contains BOTH config-derived
+# hyper-parameters (``T_max``, ``eta_min``, ``step_size``, ``gamma``, ...) and
+# progression state (``last_epoch``, ``base_lrs``, internal counters).  A
+# plain ``load_state_dict()`` would overwrite the resumed run's freshly built
+# hyper-parameters with whatever the checkpoint was trained with, and the
+# restored optimizer's param-group lrs are left at the checkpoint's final lr,
+# which does not match the restored scheduler position.  ``restore_scheduler_state``
+# fixes both: it restores only the progression keys and re-applies the
+# scheduler-computed lr to the optimizer, so a resumed run continues exactly
+# the same schedule as an uninterrupted one.
+_SCHEDULER_PROGRESSION_KEYS = frozenset({
+    'last_epoch',
+    'base_lrs',
+    '_step_count',
+    '_is_initial',
+    '_get_lr_called_within_step',
+    '_last_lr',
+    # ReduceLROnPlateau keeps its metric progress in these keys:
+    'num_bad_epochs',
+    'cooldown_counter',
+    'val_loss',
+})
+
+
+def _resync_scheduler_lr(scheduler, optimizer) -> None:
+    """Push the scheduler-computed lr into the optimizer's param groups.
+
+    Called after restoring scheduler state: the optimizer state comes from
+    the checkpoint (its final lr), while the restored ``last_epoch`` —
+    combined with the CURRENT config's hyper-parameters — defines what the
+    lr must be for the next training epoch.
+
+    Prefers the scheduler's closed-form lr (``_get_closed_form_lr``) when
+    available: in recent torch, ``get_lr()`` of some schedulers
+    (notably ``CosineAnnealingLR``) computes the next lr *incrementally* —
+    rescaling the optimizer's CURRENT group lr — so starting from the
+    checkpoint's final lr would walk the wrong curve whenever the resumed
+    schedule differs from the original one (e.g. ``T_max`` extended for a
+    longer run).  The closed form is absolute (``base_lrs`` + ``last_epoch``)
+    and therefore exact.  Schedulers without a closed form
+    (``ReduceLROnPlateau``, ``OneCycleLR``, ...) keep their
+    ``get_lr()``-based behaviour, where the optimizer's current lr is the
+    correct walking starting point.
+    """
+    closed_form = getattr(scheduler, '_get_closed_form_lr', None)
+    if callable(closed_form):
+        lrs = closed_form()
+    else:
+        lrs = scheduler.get_lr()
+    for group, lr in zip(optimizer.param_groups, lrs):
+        group['lr'] = lr
+    # Keep the scheduler's own bookkeeping consistent with the applied lrs.
+    try:
+        scheduler._last_lr = list(lrs)
+        scheduler._get_lr_called_within_step = False
+    except Exception:
+        pass
+
+
+def restore_scheduler_state(scheduler, saved_state, optimizer=None) -> None:
+    """
+    Restore only the PROGRESSION part of a saved scheduler state.
+
+    Config-derived hyper-parameters (``T_max``, ``eta_min``, ``step_size``,
+    ``gamma``, ``factor``, ``patience``, ...) stay at the freshly built
+    values from the CURRENT config — never taken from the checkpoint.  When
+    ``optimizer`` is given, the scheduler-computed lr is re-applied to its
+    param groups afterwards (see ``_resync_scheduler_lr``).
+
+    Safe for partial/older state dicts: keys missing from the checkpoint are
+    left at their fresh values.
+
+    Args:
+        scheduler:  the freshly built scheduler to restore into.
+        saved_state:  a checkpoint's ``scheduler_state_dict``.
+        optimizer:  the optimizer whose param-group lrs must match the
+                    restored scheduler position (optional).
+    """
+    if scheduler is None or not saved_state:
+        return
+    progression = {
+        key: value for key, value in dict(saved_state).items()
+        if key in _SCHEDULER_PROGRESSION_KEYS
+    }
+    scheduler.load_state_dict(progression)
+    if optimizer is not None:
+        _resync_scheduler_lr(scheduler, optimizer)
+
+
 def _is_unset(value) -> bool:
     """True for YAML-ish "not provided" values (None, False, '', 'none')."""
     return value is None or value is False or str(value).strip().lower() in ('', 'none', 'null')
@@ -221,8 +313,8 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
 
     # Initialize all parameters to not require gradients by default, then enable selectively
     # This is safer for classification mode where most parameters are frozen
-    # for name, param in all_params:
-    #     param.requires_grad = False
+    for name, param in all_params:
+        param.requires_grad = False
 
     if mode == 'ssl':
         # Legacy-compatible SSL grouping:
@@ -334,8 +426,8 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
             })
             
     elif mode == 'classification':
-        for name, param in all_params:
-            param.requires_grad = False
+        # for name, param in all_params:
+        #     param.requires_grad = False
             
         # In classification mode, by default, image and fluorescence encoders are frozen.
         # Only the classifier head is trainable.

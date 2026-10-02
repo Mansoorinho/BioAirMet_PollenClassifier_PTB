@@ -16,6 +16,7 @@ from .optimizers import (create_split_param_groups,
                         resolve_total_steps,
                         is_step_based_scheduler,
                         is_epoch_based_scheduler,
+                        restore_scheduler_state,
                         STEP_BASED_SCHEDULER_NAMES,
                         EPOCH_BASED_SCHEDULER_NAMES,
                         CLIPCosineWarmupScheduler)
@@ -51,14 +52,18 @@ from .reproducibility import set_seed
 
 from .calib_tools import ace
 
+from .export_onnx import (convert_to_onnx, export_experiment, FlatFeatureClassifier,
+                          build_flat_features, flat_feature_dim)
+
 __all__ = ['parse_config', 'load_and_merge_architecture_config', 'ConfigError', 'deep_merge', 'to_plain',
            'bn_state_summary', 'freeze_state_summary', 'bn_state_line', 'bn_freeze_warnings',
            'log_bn_and_freeze_state', 'unwrap_ddp_model',
            'is_resolved_config', 'load_experiment_config', 'save_resolved_config', 'format_resolved_yaml',
            'find_placeholder_paths', 'get_model_initialization', 'get_resume_section', 'ContrastiveLoss', 'Clip_ContrastiveLoss', 'CLIPCosineWarmupScheduler', 'negative_cosine_similarity', 'build_ssl_loss_from_config',
            'create_split_param_groups', 'get_fine_tuning_param_groups', 'build_optimizer_from_config', 'build_scheduler_from_config', 'step_scheduler',
-           'resolve_total_steps', 'is_step_based_scheduler', 'is_epoch_based_scheduler',
+           'resolve_total_steps', 'is_step_based_scheduler', 'is_epoch_based_scheduler', 'restore_scheduler_state',
            'STEP_BASED_SCHEDULER_NAMES', 'EPOCH_BASED_SCHEDULER_NAMES',
            'EarlyStoppingV2', 'setup_logger', 'log_metrics_to_file', 'setup_model_logger', 'TensorboardLogger',
            'AverageMeter', 'ProgressMeter', 'accuracy', 'plot_ssl_metrics', 'plot_classification_metrics', 'plot_confusion_matrix', 'get_sorted_confusion_matrix', 
-           'MemoryTracker', 'aggressive_memory_cleanup', 'diagnose_system', 'build_classification_loss_from_config', 'resolve_focal_alpha', 'check_label_coverage', 'set_seed', 'ace']
+           'MemoryTracker', 'aggressive_memory_cleanup', 'diagnose_system', 'build_classification_loss_from_config', 'resolve_focal_alpha', 'check_label_coverage', 'set_seed', 'ace',
+           'convert_to_onnx', 'export_experiment', 'FlatFeatureClassifier', 'build_flat_features', 'flat_feature_dim']

@@ -1,7 +1,7 @@
 '''
 @file    :   classification_trainer_v2.py
 @create date : 2026-01-10 14:05:08
-@modify date 2026-05-27 14:57:44
+@modify date 2026-09-30 14:57:44
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -16,7 +16,7 @@
 
 import os
 import contextlib
-import shutil
+# import shutil
 from typing import Dict, Optional, List
 import numpy as np
 import torch
@@ -26,7 +26,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-from .base_trainer_v2 import BaseTrainerV2, build_stage_dataloaders
+from .base_trainer_v2 import (BaseTrainerV2, build_stage_dataloaders,
+                              build_worker_init_fn, make_augmentation_epoch_counter,
+                              worker_seeding_enabled)
 from ..models import build_model_from_config
 from ..models._common import strip_ddp_prefix, ensure_state_dict_metadata
 from ..data import build_dataset_from_config, warn_category_map_num_classes
@@ -38,14 +40,16 @@ from ..utils import (
     build_scheduler_from_config,
     step_scheduler,
     is_step_based_scheduler,
+    restore_scheduler_state,
     get_fine_tuning_param_groups,
+    get_resume_section,
     EarlyStoppingV2,
     AverageMeter,
     accuracy,
     plot_classification_metrics,
     plot_confusion_matrix,
     get_sorted_confusion_matrix,
-    CLIPCosineWarmupScheduler
+    # CLIPCosineWarmupScheduler
 )
 
 
@@ -164,6 +168,11 @@ class ClassificationTrainerV2(BaseTrainerV2):
             rank=self.rank
         )
         
+        # Restore the early-stopping state (patience counter + best score)
+        # from the resume checkpoint, if present. 
+        if self._should_resume_training():
+            self._load_resume_early_stopping_state()
+        
         # Log model info
         if self.rank == 0:
             self._log_model_info()
@@ -203,8 +212,7 @@ class ClassificationTrainerV2(BaseTrainerV2):
     
     def _should_resume_training(self) -> bool:
         """Check if resume mode is enabled in config."""
-        model_init = getattr(self.config, 'model_initialization', {})
-        resume_config = model_init.get('resume', {})
+        resume_config = get_resume_section(self.config)
         return resume_config.get('enable', False) and resume_config.get('checkpoint_path') is not None
     
     def _load_resume_optimizer_state(self) -> None:
@@ -219,7 +227,7 @@ class ClassificationTrainerV2(BaseTrainerV2):
         NOTE: Model weights are loaded by build_model_from_config() via the model builder.
         This method only handles optimizer/scheduler state and training metadata.
         """
-        resume_config = self.config.model_initialization.get('resume', {})
+        resume_config = get_resume_section(self.config)
         checkpoint_path = resume_config.get('checkpoint_path')
         
         if not checkpoint_path or not os.path.exists(checkpoint_path):
@@ -267,7 +275,7 @@ class ClassificationTrainerV2(BaseTrainerV2):
         loader in setup() runs first, while self.scheduler is still None, so
         the scheduler state is restored here instead.
         """
-        resume_config = self.config.model_initialization.get('resume', {})
+        resume_config = get_resume_section(self.config)
         checkpoint_path = resume_config.get('checkpoint_path')
 
         if self.scheduler is None:
@@ -280,7 +288,13 @@ class ClassificationTrainerV2(BaseTrainerV2):
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             if 'scheduler_state_dict' in checkpoint:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                # Progression-only restore: the CURRENT config's hyper-
+                # parameters (T_max/eta_min/...) win over the checkpoint's,
+                # and the scheduler-computed lr is re-applied to the restored
+                # optimizer so the next epoch trains at the correct lr.
+                restore_scheduler_state(
+                    self.scheduler, checkpoint['scheduler_state_dict'],
+                    self.optimizer)
                 if self.rank == 0:
                     self.model_logger.info("Scheduler state restored from checkpoint")
             elif self.rank == 0:
@@ -291,6 +305,24 @@ class ClassificationTrainerV2(BaseTrainerV2):
             if self.rank == 0:
                 self.model_logger.error(f"Failed to load resume scheduler state: {e}")
     
+
+    def _load_resume_early_stopping_state(self) -> None:
+        """
+        Restore the early-stopping state (patience counter + best score) from
+        the resume checkpoint, if present. No-op for fresh runs or for old
+        checkpoints that predate this state.
+        """
+        resume_config = get_resume_section(self.config)
+        checkpoint_path = resume_config.get('checkpoint_path')
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            return
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        except Exception as e:
+            if self.rank == 0:
+                self.model_logger.error(f"Failed to load resume early-stopping state: {e}")
+            return
+        self._restore_early_stopping_state(checkpoint.get('early_stopping_state'))
 
     def _apply_gradient_manipulations(self, clip_ui: Dict[str, str]) -> torch.Tensor:
         """
@@ -314,9 +346,12 @@ class ClassificationTrainerV2(BaseTrainerV2):
         if self.config.train.gradient_clipping.enable:
             self._apply_gradient_clipping(grad_norm, clip_ui)
         
-        # Apply gradient manipulation based on norm_mode
-        if getattr(self.config.train.gradient_regularization, "enabled", False):
-            norm_mode = self.config.train.gradient_regularization.get("norm_mode", "gradient_noise")
+        # Apply gradient manipulation based on norm_mode. The section flag is
+        # 'enable' (the spelling used by every shipped config and by the SSL
+        # stage); 'enabled' is still accepted. 
+        grad_reg = self.config.train.get("gradient_regularization", {}) or {}
+        if grad_reg.get("enable", grad_reg.get("enabled", False)):
+            norm_mode = grad_reg.get("norm_mode", "gradient_noise")
             
             if norm_mode == "gradient_noise":
                 self._apply_gradient_noise(clip_ui)
@@ -326,6 +361,9 @@ class ClassificationTrainerV2(BaseTrainerV2):
                 self._apply_linf_gradient_normalization(clip_ui)
             elif norm_mode == "step_scaling":
                 self._apply_step_scaling(clip_ui, grad_norm)
+            elif norm_mode == "img_encoder_grad_down_scaling":
+                # Shared with the SSL stage (BaseTrainerV2). 
+                self._apply_imgenc_grad_scaling(clip_ui)
             else:
                 raise ValueError(f"Unsupported norm_mode: {norm_mode}")
         
@@ -793,9 +831,14 @@ class ClassificationTrainerV2(BaseTrainerV2):
             self._log_bn_freeze_audit()
             # Record exactly which augmentations this run uses (training.log)
             self._log_augmentation_info(train_loader)
+            # Record the DataLoader worker-seed policy (on/off)
+            self._log_worker_seeding_policy(train_loader)
 
         for epoch in range(self.current_epoch, num_epochs):
             self.current_epoch = epoch
+            # Publish the epoch to the DataLoader workers so they re-seed their
+            # augmentation RNG streams (no-op when the feature is off)
+            self._advance_augmentation_epoch(epoch)
             
             # Set epoch for distributed sampler
             if hasattr(train_loader.sampler, 'set_epoch'):
@@ -830,17 +873,15 @@ class ClassificationTrainerV2(BaseTrainerV2):
                     self.best_metric = val_metrics['loss']
                     is_best = True
             
-            # Save checkpoint
-            self.save_checkpoint(epoch, is_best=is_best, mode='classification')
-            
-            # Step epoch-based schedulers after each epoch (only on rank 0 to avoid race conditions)
-            if self.rank == 0 and self.scheduler is not None:
+            # Step epoch-based schedulers after each epoch. 
+            if self.scheduler is not None:
                 from torch.optim.lr_scheduler import ReduceLROnPlateau
                 
                 # ReduceLROnPlateau requires a metric to step
                 if isinstance(self.scheduler, ReduceLROnPlateau):
                     # Step with validation loss (lower is better)
-                    self.scheduler.step(val_metrics.get('loss', float('inf')))
+                    if val_metrics:
+                        self.scheduler.step(val_metrics.get('loss', float('inf')))
                 # Step-based schedulers (OneCycleLR, CosineAnnealingWarmRestarts,
                 # CLIPCosineWarmupScheduler) are stepped once per optimizer step
                 # in train_epoch and must NOT be stepped here.
@@ -848,8 +889,8 @@ class ClassificationTrainerV2(BaseTrainerV2):
                     self.scheduler.step()
             
             # Early stopping check (broadcast decision for synchronized exit)
+            stop = False
             if self.early_stopping is not None and val_loader is not None:
-                stop = False
                 if self.rank == 0:
                     # Legacy parity: early stopping on validation loss (lower is better)
                     stop = self.early_stopping(
@@ -864,9 +905,12 @@ class ClassificationTrainerV2(BaseTrainerV2):
                     stop_tensor = torch.tensor([1 if stop else 0], device=self.device)
                     dist.broadcast(stop_tensor, src=0)
                     stop = bool(stop_tensor.item())
-                
-                if stop:
-                    break
+            
+            # Save checkpoint AFTER the early-stopping evaluation
+            self.save_checkpoint(epoch, is_best=is_best, mode='classification')
+            
+            if stop:
+                break
         
         if self.rank == 0:
             self.model_logger.info(
@@ -992,15 +1036,12 @@ def train_supervised_worker_v2(rank, world_size, config, device_id):
     import shutil
     from torch.utils.data import DataLoader, DistributedSampler
     
-    # Worker init function for reproducibility
-    def _worker_init_fn(worker_id):
-        import random
-        import numpy as np
-        import torch
-        worker_seed = config.seed + rank + worker_id
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-        random.seed(worker_seed)
+    # Worker seeding (train.worker_seeding, default ON) is built below, once
+    # the datasets exist: build_worker_init_fn keeps PyTorch's auto-seeded
+    # worker torch RNG untouched and re-seeds the numpy/random + image-
+    # augmentation RNG object that fork() copied into every worker (otherwise
+    # all workers replay the same rotation/translation sequence - see
+    # build_worker_init_fn).
     
     # Create trainer
     trainer = ClassificationTrainerV2(config, rank, world_size, device_id)
@@ -1016,6 +1057,22 @@ def train_supervised_worker_v2(rank, world_size, config, device_id):
     if rank == 0:
         warn_category_map_num_classes(config, trainer.model_logger)
     
+    # Worker seeding (train.worker_seeding, default ON): numpy/random +
+    # augmentation RNGs only — the worker torch RNG keeps PyTorch's auto-seed.
+    # A Subset wrapper (data.subset_percentage), if any, is unwrapped inside
+    # build_worker_init_fn.  When ON, the shared epoch counter lets the
+    # persistent workers refresh those streams at every epoch boundary; the
+    # same object reaches the trainer below.  When OFF, no worker_init_fn is
+    # passed at all.
+    if worker_seeding_enabled(config):
+        aug_epoch_counter = make_augmentation_epoch_counter()
+        worker_init_fn = build_worker_init_fn(train_dataset,
+                                              epoch_counter=aug_epoch_counter)
+    else:
+        aug_epoch_counter = None
+        worker_init_fn = None
+    trainer.attach_augmentation_epoch_counter(aug_epoch_counter)
+
     # Build data loaders (shared with the SSL stage — see
     # build_stage_dataloaders for the exact semantics).
     train_loader, val_loader = build_stage_dataloaders(
@@ -1025,7 +1082,7 @@ def train_supervised_worker_v2(rank, world_size, config, device_id):
         train_always_sharded=False,  # plain shuffle at world_size=1
         val_sharded=True,         # shard the val set across ranks
         val_rank0_only=False,
-        worker_init_fn=_worker_init_fn,
+        worker_init_fn=worker_init_fn,
     )
     # Class-coverage check: report (rank 0) which classes/samples were
     # excluded because their label is outside the configured num_classes or

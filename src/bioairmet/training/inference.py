@@ -138,12 +138,35 @@ def _load_checkpoint(checkpoint_path: str, model: nn.Module, device: torch.devic
 
 
 def _prepare_model(model: nn.Module, logger: logging.Logger) -> nn.Module:
+    """Put the model into deterministic inference state (eval / no-grad).
+
+    BatchNorm note: ``eval()`` is all that is needed - a BatchNorm layer in
+    eval mode normalises with its stored running statistics. ``track_running_
+    stats`` must stay ``True``: setting it to ``False`` does not mean "use the
+    stored statistics", it switches tracking off, and per the PyTorch BatchNorm
+    contract a layer that does not track normalises with *batch* statistics
+    (``training = self.training or not self.track_running_stats``) - which
+    would make a prediction depend on the other samples in its batch (and at
+    batch size 1 collapse the features to zero). Whether the eval path happens
+    to keep using the stored buffers is PyTorch-version dependent, so it is
+    never relied on here. See ``utils/bn_audit.py`` for the project-wide
+    convention.
+    """
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
-    for m in model.modules():
-        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            m.track_running_stats = False
+    bn_modules = [m for m in model.modules()
+                  if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
+    if bn_modules:
+        n_train = sum(1 for m in bn_modules if m.training)
+        n_track = sum(1 for m in bn_modules if getattr(m, 'track_running_stats', True))
+        if n_train:
+            logger.warning(
+                f"  {n_train}/{len(bn_modules)} BatchNorm layer(s) still in train mode "
+                f"after eval() - predictions would depend on the batch composition")
+        logger.info(f"  BatchNorm       : {len(bn_modules)} layer(s) in eval mode, "
+                    f"{n_track}/{len(bn_modules)} tracking running statistics "
+                    f"(stored statistics used for normalisation)")
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"Model ready  |  params: {total:,}  |  mode: eval / no-grad")
     return model
@@ -392,6 +415,17 @@ def run_inference(
         num2name = {}
 
     # ---- Inference loop -----------------------------------------------
+    # Mixed precision follows the training configuration (``train.
+    # mixed_precision``), exactly like the in-training validation loop. It used
+    # to be forced ON whenever CUDA was available, which meant inference ran in
+    # fp16 even for models trained and validated in fp32 - a needless (if small)
+    # numerical difference between the reported validation accuracy and the
+    # predictions written to the CSV.
+    try:
+        use_amp = bool(config.train.get('mixed_precision', False)) and device.type == "cuda"
+    except (AttributeError, TypeError):
+        use_amp = False
+    logger.info(f"Autocast       : {'enabled (fp16, config train.mixed_precision)' if use_amp else 'disabled (fp32)'}")
     logger.info("\nRunning inference ...")
     all_preds      = []
     all_probs      = []
@@ -406,7 +440,7 @@ def run_inference(
             img2 = batch["image"][1].to(device, non_blocking=True)
             fluo = batch["fluorescence"].to(device, non_blocking=True)
 
-            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+            with autocast(device_type="cuda", enabled=use_amp):
                 logits = model(img1, img2, fluo)
 
             probs = torch.softmax(logits, dim=1).cpu()
@@ -804,6 +838,19 @@ def _test_model_worker(rank, world_size, config, device_id=None):
 
             all_preds.extend(outputs.argmax(dim=1).cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+
+    # Aggregate over all ranks before tearing down the process group: every rank
+    # only evaluated its own shard of the test set, so printing rank 0's local
+    # average reported the accuracy of 1/world_size of the data. The training
+    # validation loop reduces the same way (ClassificationTrainerV2.validate_epoch).
+    if world_size > 1:
+        correct = torch.tensor([float(top1.sum)], device=device)
+        counted = torch.tensor([float(top1.count)], device=device)
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(counted, op=dist.ReduceOp.SUM)
+        total = counted.item()
+        top1.avg = float(correct.item() / total) if total > 0 else 0.0
+        top1.count = int(total)
 
     if world_size > 1:
         dist.destroy_process_group()

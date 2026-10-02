@@ -478,6 +478,45 @@ def validate_config(config, mode):
             "are both true — enable at most one"
         )
 
+    # Resume checkpoint: when resume is enabled, the checkpoint must be
+    # specified AND exist. Otherwise the SSL stage would silently train from
+    # scratch while the classification stage crashed inside the training
+    # worker — fail fast with an actionable error before anything is created.
+    if resume.get("enable"):
+        ckpt_path = resume.get("checkpoint_path")
+        if not ckpt_path:
+            problems.append(
+                "model_initialization.resume.enable is true but "
+                "model_initialization.resume.checkpoint_path is empty"
+            )
+        elif not os.path.isfile(ckpt_path):
+            problems.append(
+                f"model_initialization.resume.checkpoint_path does not exist: {ckpt_path}"
+            )
+
+    # --- non-fatal notes: keys that ship in older configs but are not read ---
+    # `data.img_count_per_sample` and `data.category_string_column_name` were
+    # documented in earlier releases without any code ever reading them, so they
+    # are gone from the shipped configs. Warn (never fail) when one still asks
+    # for the behaviour it used to promise, instead of ignoring it in silence:
+    # the number of images per row is detected from the h5 row itself (a path,
+    # or a pair of paths — see `data.stitch_images`), and labels come from
+    # `data.category_number_column_name` + `data.cat_map_path`.
+    img_count = data.get("img_count_per_sample", None)
+    if img_count not in (None, 1, "1"):
+        print(
+            f"Config note: data.img_count_per_sample={img_count!r} has no "
+            "effect — the loaders detect a single path or a pair of paths per "
+            "row from the h5 data itself; data.stitch_images decides how a "
+            "pair is used."
+        )
+    if data.get("category_string_column_name", None):
+        print(
+            "Config note: data.category_string_column_name has no effect — "
+            "labels come from data.category_number_column_name together with "
+            "data.cat_map_path."
+        )
+
     if problems:
         raise ConfigError(
             "Configuration is invalid:\n  - " + "\n  - ".join(problems)

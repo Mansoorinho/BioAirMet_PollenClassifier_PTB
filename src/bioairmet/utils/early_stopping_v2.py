@@ -32,11 +32,11 @@ class EarlyStoppingV2:
     - Cleaner code, easier to understand
     
     Usage:
-        # For SSL (minimize loss)
+        # Both stages currently minimize validation loss:
         early_stop = EarlyStoppingV2(patience=10, mode='min')
         
-        # For classification (maximize accuracy)
-        early_stop = EarlyStoppingV2(patience=10, mode='max')
+        # (mode='max' is available for accuracy-style metrics, e.g.
+        # early_stop = EarlyStoppingV2(patience=10, mode='max'))
         
         # In training loop
         if early_stop(current_metric, model):

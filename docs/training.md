@@ -98,6 +98,24 @@ plus `resume.checkpoint_path` — the architecture is resolved from the
 checkpoint's experiment directory (same self-contained rule as inference), so
 you only need the checkpoint path.
 
+Resume restores the complete training state: model weights, the optimizer
+(step counts and AdamW moments), the LR scheduler's *progression* (epoch
+position and base LRs — the resumed run keeps the **current** config's
+schedule hyper-parameters, e.g. an extended `T_max` when you resume to train
+more epochs than the original run planned), the AMP scaler, the best metric,
+and the early-stopping patience window. Checkpoints are written after each
+epoch's early-stopping evaluation, so resuming is exactly equivalent to
+continuing the uninterrupted run: the first resumed epoch trains at the
+learning rate the uninterrupted run would have used, and the final
+scheduler/optimizer states are identical (verified by the resume round-trip
+test for both SSL and classification).
+
+Invalid combinations fail fast before anything is created, e.g.
+`resume.enable: true` with an empty or missing `checkpoint_path`, or
+`pretrained.enable: true` together with `resume.enable: true` (enable at most
+one — a resumed run takes its weights from the checkpoint, not from a
+pretrained bundle).
+
 ---
 
 ## Reading the BatchNorm / freeze lines in `training.log`
@@ -118,6 +136,68 @@ right after the build (that is the freeze policy doing its job). The first
 `update_batchnorm_stats_*: true` and the encoders otherwise frozen, expect the
 image encoder's buffers to advance **twice per batch** (once per view), which is
 also visible as `num_batches_tracked` growing by `2 × steps_per_epoch` per epoch.
+
+---
+
+## DataLoader worker seeding (`train.worker_seeding`)
+
+One master on/off switch per stage (both templates default `True`), resolved by
+`worker_seeding_enabled()` in `src/bioairmet/trainers/base_trainer_v2.py`. The
+legacy key `train.vary_augmentation_seed_per_epoch` is still honoured as a
+fallback when the new key is absent.
+
+**ON (default) — the "robust" scheme.** PyTorch's DataLoader already seeds each
+worker's torch RNG from a fresh draw of the main process RNG plus the worker id
+(before `worker_init_fn` runs). `build_worker_init_fn` does NOT touch that
+generator — the auto-seeded stream is the one that gave the most robust SSL
+runs — and seeds only what the loader does not manage, with
+`torch.initial_seed()` (the auto-seed value, already distinct per worker and per
+DDP rank, and reproducible across runs with the same `config.seed`):
+
+* the module-level `random` / `numpy.random` generators (fork-duplicated across
+  workers without this), and
+* the augmentation pipeline's own RNG (`ImageAugmentation_Generic`'s internal
+  `random.Random`), also fork-duplicated — without it, all workers replay the
+  *same* rotation/translation sequence, and because the DataLoader hands
+  sample *i* to worker `i % num_workers`, one batch ends up sharing a handful
+  of angles instead of getting one per sample.
+
+The same function registers a shared epoch counter on the dataset
+(`HDF5Dataset.attach_augmentation_epoch`); the trainer publishes each new epoch
+into it (`BaseTrainerV2._advance_augmentation_epoch`), and the worker refreshes
+the `random`/`numpy`/augmentation streams at
+`torch.initial_seed() + epoch * 100003`
+(`HDF5Dataset._sync_augmentation_epoch`) — the torch RNG still keeps its
+auto-seed for the whole run. This matters because the training loader uses
+`persistent_workers=True`: workers are forked once, so `worker_init_fn` runs
+once.
+
+**OFF — no seeding at all.** No `worker_init_fn` is passed to the loader: we seed
+nothing. PyTorch still auto-seeds the worker torch RNG, and the
+`random`/`numpy`/augmentation RNGs keep the fork-duplicated state (identical
+streams in every worker). This is the bare "no reproducibility" setting; for
+SSL with the legacy pipeline (torch-driven only, `fluo_aug_prob: 0`) the data
+stream is then exactly the one without our intervention.
+
+Properties worth knowing:
+
+* **ON is reproducible** across runs with the same `config.seed` (the auto-seed
+  is drawn from the main RNG whose state is deterministic), with distinct
+  streams per worker and per rank.
+* **Cost** of the per-epoch refresh: one shared-memory read plus one integer
+  comparison per sample; the re-seeding happens once per worker per epoch.
+* **Prefetching**: samples already queued when the epoch advances keep the old
+  stream, so the exact non-torch stream depends on `num_workers` / prefetch
+  depth (as it always does).
+* **`num_workers: 0` is unaffected** either way — `worker_init_fn` never runs,
+  and the main process' generators are left alone (they also drive model
+  internals such as dropout).
+* Both stage logs print the active policy as a `Worker RNG seeding: …` line at
+  the start of training.
+
+This is a diversity knob, not a known accuracy win: which of ON/OFF is better
+has to be decided over several seeds per stage, the same as any other
+augmentation change.
 
 ---
 

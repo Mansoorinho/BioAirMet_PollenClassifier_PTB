@@ -48,14 +48,18 @@ data:
   cat_map_path: src/bioairmet/config/classification/cats_dict.txt
 
   # --- ADVANCED ------------------------------------------------------------
-  # name of the image column in the h5 file, if img_count_per_sample=2, this
-  # should contain a list of two image paths for each sample otherwise a single image path
+  # name of the image column in the h5 file. A row may hold ONE image path or a
+  # pair of paths (two views of the same event): the loader detects which from
+  # the row content. data.stitch_images then decides whether a pair is stitched
+  # side by side into one wide image (the case Stage 1 was trained on) or passed
+  # as two separate views.
   image_column_name: "images" # name of the image column in the h5 file
   # name of the fluorescence spectra column in the h5 file, relative_spectra is
   # already extracted from the json file in (3, 5) shape
   fluorescence_spectra_column_name: "relative_spectra"
+  # the label source: integer column (0,1,...) together with cat_map_path. A
+  # string category column in the h5 file is not read by the trainers.
   category_number_column_name: "category_num" # integer e.g. 0,1 ...
-  category_string_column_name: "category" # string e.g. Betula, Fraxinus ...
 
   # General image settings
   # image resolution, images will be resized to this size during data loading if not already in this size.
@@ -261,7 +265,7 @@ train:
   gradient_accumulation_steps: 1 # >1 = N micro-batches per optimiser update. The
                                  # last (partial) window of an epoch is still applied,
                                  # so updates/epoch = ceil(steps_per_epoch / this value)
-  mixed_precision: False # Enabled for performance
+  mixed_precision: True # Enabled for performance
 
   # --- THROUGHPUT SWITCHES ----------------------------------------------------
   # All three default to OFF in code; this template turns the first two on.
@@ -276,6 +280,21 @@ train:
   channels_last: False # NHWC memory format for model + inputs (biggest win on these
                        # small conv nets, see numbers above). Left off by default so
                        # results stay comparable with previous NCHW runs.
+
+  # --- DATALOADER RNG STREAMS -------------------------------------------------
+  worker_seeding: True # Master on/off switch for worker RNG seeding.
+                       # True  = robust scheme: each worker's torch RNG keeps
+                       #         PyTorch's auto-seed (the stream that gave the
+                       #         most robust SSL runs); the random/numpy and
+                       #         augmentation RNGs are seeded per worker
+                       #         (torch.initial_seed() based) and refreshed
+                       #         every epoch (+epoch*100003).
+                       # False = no worker_init_fn at all: nothing is seeded by
+                       #         us (PyTorch still auto-seeds the worker torch
+                       #         RNG); random/numpy/aug-RNGs keep the
+                       #         fork-duplicated state. Bare "no reproducibility"
+                       #         experiments.
+                       # num_workers: 0 is unaffected either way.
 
   gradient_clipping:
     enable: True # Set to True to enable gradient clipping
