@@ -1,7 +1,7 @@
 '''
 @file    :   datasets_cls.py
 @create date : 2026-01-25 10:07:49
-@modify date 2026-09-29 15:09:00
+@modify date 2026-10-08 15:09:00
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -1572,7 +1572,7 @@ def build_ssl_dataset(config):
     # Pass a deterministic seed to the augmentation so that image augmentations
     # are reproducible across runs. The seed is derived from the global seed and
     # an offset for the augmentation-specific RNG.
-    train_aug_seed = c['seed'] + 1000
+    train_aug_seed = c['seed'] #+ 1000
     train_source_dataset = Stage1Dataset(
         **base_kwargs,
         fluo_aug_prob=c['fluo_aug_prob'],
@@ -1767,7 +1767,7 @@ def build_classification_dataset(config):
         image_transforms=aug.get('image_transforms', None),
         unlabeled_stats=unlabeled_data_stats,
         num_classes=head_num_classes,
-        seed=config.get('seed', 42) + 2000  # Different offset from SSL augmentation
+        seed=config.get('seed', 42) #+ 2000  # Different offset from SSL augmentation
     )
 
     val_dataset = Stage2Dataset(

@@ -1035,7 +1035,14 @@ def train_supervised_worker_v2(rank, world_size, config, device_id):
     """
     import shutil
     from torch.utils.data import DataLoader, DistributedSampler
-    
+    seed = config.seed + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    print(f"Seed set to {seed} for random, numpy, torch, and cudnn.")
     # Worker seeding (train.worker_seeding, default ON) is built below, once
     # the datasets exist: build_worker_init_fn keeps PyTorch's auto-seeded
     # worker torch RNG untouched and re-seeds the numpy/random + image-

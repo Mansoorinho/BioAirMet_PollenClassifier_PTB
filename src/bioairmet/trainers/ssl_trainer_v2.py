@@ -704,8 +704,8 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     # build_stage_dataloaders for the exact semantics).
     train_loader, val_loader = build_stage_dataloaders(
         config, train_dataset, val_dataset, rank, world_size,
-        train_drop_last=False,      # contrastive loss needs full batches
-        val_drop_last=False,
+        train_drop_last=True,      # contrastive loss needs full batches
+        val_drop_last=True,
         train_always_sharded=True,  # SSL always uses a DistributedSampler
         val_sharded=False,          # validation runs on rank 0 only
         val_rank0_only=True,
