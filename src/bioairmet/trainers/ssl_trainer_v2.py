@@ -450,7 +450,9 @@ class SSLTrainerV2(BaseTrainerV2):
             # 'image_embeddings', 'fl_embeddings' and 'logit_scale'.
             with autocast(device_type=self.device.type, enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                 model_output = self.model(images, fl_features)
-            loss = compute_ssl_loss(self.criterion, model_output.to(dtype=self.loss_dtype))
+            loss = compute_ssl_loss(self.criterion, {k: v.to(dtype=self.loss_dtype) if isinstance(v, torch.Tensor) else v
+                                                    for k, v in model_output.items()}) # cast to float32 for loss computation
+                
             
             img_embeddings = model_output['image_embeddings']
             fl_embeddings = model_output['fl_embeddings']
@@ -576,7 +578,8 @@ class SSLTrainerV2(BaseTrainerV2):
                 # validation to produce numerically identical results.
                 with autocast(device_type=self.device.type, enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                     model_output = self.model(images, fl_features)
-                loss = compute_ssl_loss(self.val_criterion, model_output.to(dtype=self.loss_dtype))
+                loss = compute_ssl_loss(self.val_criterion, {k: v.to(dtype=self.loss_dtype) if isinstance(v, torch.Tensor) else v
+                                                    for k, v in model_output.items()}) 
 
                 # Metrics (match the training computation exactly). The embeddings
                 # are already L2-normalised inside the model, so no re-normalisation.
