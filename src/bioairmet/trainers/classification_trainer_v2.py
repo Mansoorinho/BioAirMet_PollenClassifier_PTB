@@ -77,7 +77,7 @@ class ClassificationTrainerV2(BaseTrainerV2):
         # Classification-specific attributes
         self.criterion = None
         self.grad_accum_steps = config.train.gradient_accumulation_steps
-        self.use_mixed_precision = config.train.mixed_precision
+        self.use_mixed_precision = config.train.mixed_precision    
         self.num_classes = config.architecture_setup.classification_model.num_classes
         
         # Track best metrics (best model based on lowest loss)
@@ -133,11 +133,15 @@ class ClassificationTrainerV2(BaseTrainerV2):
         # Build loss
         self.criterion = build_classification_loss_from_config(self.config).to(self.device)
         
-        # Build optimizer
+        # Build optimizer. The logger makes the resolved parameter groups
+        # (name, tensors, parameters, LR, weight decay) readable in
+        # training.log on rank 0.
         param_groups = get_fine_tuning_param_groups(
             self.model, None, self.config, mode='classification'
         )
-        self.optimizer = build_optimizer_from_config(self.config, param_groups)
+        self.optimizer = build_optimizer_from_config(
+            self.config, param_groups,
+            logger=self.model_logger if self.rank == 0 else None)
         
         # If resuming training, load optimizer state and training metadata
         # This must happen AFTER optimizer is created but BEFORE scheduler
@@ -156,8 +160,28 @@ class ClassificationTrainerV2(BaseTrainerV2):
         
         # Setup mixed precision
         if self.use_mixed_precision:
+            amp_dtype = self.config.train.get('amp_dtype', 'float16')
+            loss_type = self.config.train.get('loss_precision_dtype', 'float32')
+            self.loss_dtype = torch.bfloat16 if loss_type == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if loss_type == 'float16' else torch.float32)
+            default_dtype = torch.get_autocast_dtype("cuda")
+            self.model_logger.info(f"Default autocast dtype: {default_dtype}, Configured AMP dtype: {amp_dtype}, Loss precision dtype: {self.loss_dtype}")
+            self.amp_dtype = torch.bfloat16 if amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if amp_dtype == 'float16' else torch.float32)
+        else:
+            self.amp_dtype = torch.float32 
+            self.loss_dtype = torch.float32
+            self.model_logger.info("Mixed precision disabled; using float32 for all computations.")
+            
+        if self.use_mixed_precision and amp_dtype == 'float16':
+            self.loss_dtype = torch.bfloat16 if loss_type == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if loss_type == 'float16' else torch.float32)
             self.scaler = GradScaler()
-        
+            self.model_logger.info(f"Using mixed precision: {self.use_mixed_precision}, AMP dtype: {self.amp_dtype}, Loss precision dtype: {self.loss_dtype}")
+            try:
+                self.model_logger.info(f"GradScaler scale: {self.scaler.get_scale()}")
+            except Exception as e:
+                self.model_logger.warning(f"Could not get GradScaler scale: {e}")    
+        else:
+            self.scaler = None
+
         # Setup early stopping (legacy parity: minimize validation loss)
         self.early_stopping = EarlyStoppingV2(
             patience=self.config.train.early_stopping.patience,
@@ -505,17 +529,18 @@ class ClassificationTrainerV2(BaseTrainerV2):
             labels = batch['label'].to(self.device, non_blocking=True)
             
             # Forward pass with mixed precision
-            with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+            with autocast(device_type='cuda', enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                 outputs = self.model(img1, img2, fl_spectra)
-                loss = self.criterion(outputs, labels)
-                
-                # Scale loss for gradient accumulation (the partial final window
-                # of the epoch is divided by its own size).
-                effective_accum_steps = (
-                    final_window_size if batch_idx >= final_window_start
-                    else self.grad_accum_steps
-                )
-                loss = loss / effective_accum_steps
+
+            loss = self.criterion(outputs.to(dtype=self.loss_dtype), labels)
+            
+            # Scale loss for gradient accumulation (the partial final window
+            # of the epoch is divided by its own size).
+            effective_accum_steps = (
+                final_window_size if batch_idx >= final_window_start
+                else self.grad_accum_steps
+            )
+            loss = loss / effective_accum_steps
             
             is_last_accum_step = (
                 (batch_idx + 1) % self.grad_accum_steps == 0
@@ -614,9 +639,9 @@ class ClassificationTrainerV2(BaseTrainerV2):
                 labels = batch['label'].to(self.device, non_blocking=True)
                 
                 # Forward pass
-                with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                with autocast(device_type='cuda', enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                     outputs = self.model(img1, img2, fl_spectra)
-                    loss = self.criterion(outputs, labels)
+                loss = self.criterion(outputs.to(dtype=self.loss_dtype), labels)
                 
                 # Metrics
                 acc1 = accuracy(outputs, labels, topk=(1,))[0]
@@ -727,7 +752,7 @@ class ClassificationTrainerV2(BaseTrainerV2):
                     fl_spectra = batch['fluorescence'].to(self.device, non_blocking=True)
                     labels = batch['label'].to(self.device, non_blocking=True)
 
-                    with autocast(device_type='cuda', enabled=self.use_mixed_precision):
+                    with autocast(device_type='cuda', enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                         outputs = eval_model(img1, img2, fl_spectra)
 
                     acc1 = accuracy(outputs, labels, topk=(1,))[0]
@@ -1035,6 +1060,7 @@ def train_supervised_worker_v2(rank, world_size, config, device_id):
     """
     import shutil
     from torch.utils.data import DataLoader, DistributedSampler
+    import random
     seed = config.seed + rank
     random.seed(seed)
     np.random.seed(seed)

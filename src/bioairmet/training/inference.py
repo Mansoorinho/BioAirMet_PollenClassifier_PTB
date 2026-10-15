@@ -423,6 +423,14 @@ def run_inference(
     # predictions written to the CSV.
     try:
         use_amp = bool(config.train.get('mixed_precision', False)) and device.type == "cuda"
+        if use_amp:
+            amp_dtype = config.train.get('amp_dtype', 'float16')
+            default_dtype = torch.get_autocast_dtype("cuda")
+            logger.info(f"Default autocast dtype: {default_dtype}, Mixed precision enabled. Configured AMP dtype: {amp_dtype}")
+            amp_dtype = torch.bfloat16 if amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if amp_dtype == 'float16' else torch.float32)
+        else:
+            amp_dtype = torch.float32 
+            logger.info("Mixed precision disabled; using float32 for all computations.")
     except (AttributeError, TypeError):
         use_amp = False
     logger.info(f"Autocast       : {'enabled (fp16, config train.mixed_precision)' if use_amp else 'disabled (fp32)'}")
@@ -440,7 +448,7 @@ def run_inference(
             img2 = batch["image"][1].to(device, non_blocking=True)
             fluo = batch["fluorescence"].to(device, non_blocking=True)
 
-            with autocast(device_type="cuda", enabled=use_amp):
+            with autocast(device_type="cuda", enabled=use_amp, dtype=dtype=amp_dtype):
                 logits = model(img1, img2, fluo)
 
             probs = torch.softmax(logits, dim=1).cpu()

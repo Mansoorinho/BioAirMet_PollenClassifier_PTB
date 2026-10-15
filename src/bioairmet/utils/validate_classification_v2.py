@@ -22,7 +22,7 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.amp import autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 import datetime
 import logging
@@ -327,7 +327,18 @@ def validate_classification_model_v2(
     
     # Build loss function
     criterion = build_classification_loss_from_config(config).to(device)
-    
+    if config.train.mixed_precision:
+        amp_dtype = config.train.get('amp_dtype', 'float16')
+        loss_type = config.train.get('loss_precision_dtype', 'float32')
+        loss_dtype = torch.bfloat16 if loss_type == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if loss_type == 'float16' else torch.float32)
+        default_dtype = torch.get_autocast_dtype("cuda")
+        logger.info(f"Default autocast dtype: {default_dtype}, Mixed precision enabled. Configured AMP dtype: {amp_dtype}, Loss precision dtype: {loss_dtype}")
+        amp_dtype = torch.bfloat16 if amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if amp_dtype == 'float16' else torch.float32)
+    else:
+        amp_dtype = torch.float32 
+        loss_dtype = torch.float32
+        logger.info("Mixed precision disabled; using float32 for all computations.")
+        
     # Validation loop
     logger.info("\nStarting validation...")
     logger.info("-" * 80)
@@ -349,9 +360,10 @@ def validate_classification_model_v2(
             labels = batch['label'].to(device, non_blocking=True)
             
             # Forward pass
-            with autocast(device_type='cuda', enabled=config.train.mixed_precision):
+            with autocast(device_type='cuda', enabled=config.train.mixed_precision, dtype=amp_dtype):
                 outputs = model(img1, img2, fluo_features)
-                loss = criterion(outputs, labels)
+ 
+            loss = criterion(outputs.to(dtype=loss_dtype), labels)
             
             # Compute accuracy
             acc1 = accuracy(outputs, labels, topk=(1,))[0]

@@ -30,3 +30,4 @@ fluorescence_tower:
   dropout: 0.25
   activation: 'relu' # options: 'relu, 'gelu'
   norm: 'bn' # options: 'bn', 'ln', None
+  first_layer_bias: True # options, True or False, could be turned off (False) as we have bn after this layer

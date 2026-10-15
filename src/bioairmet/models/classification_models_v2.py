@@ -1,7 +1,7 @@
 '''
 @file    :   classification_models_v2.py
 @create date : 2026-01-19 11:25:33
-@modify date 2026-08-25
+@modify date 2026-10-07 12:09:13
 @author  :   Mansoor Nabawi
 @version :   2.0
 @contact :   mansoor.nabawi@gmail.com
@@ -102,7 +102,9 @@ class HoloClassifierV2(nn.Module):
         # L2 normalisation before concatenation
         self.l2_normalization = config['architecture_setup']['classification_model'].get(
             'feature_l2_normalization_enabled', True)
-
+        
+        self._build_layernorm_per_encoder(config['architecture_setup'])
+        
         # Concatenated feature dimension: img_a + img_b + fl
         concatenated_dim = img_feature_dim * 2 + fl_feature_dim
 
@@ -190,12 +192,36 @@ class HoloClassifierV2(nn.Module):
             ]
         else:  # 'one_layer'
             head = []
-            if use_layernorm:
-                head.append(nn.LayerNorm(concatenated_dim))
-                head.append(nn.Dropout(dropout))
+            # if use_layernorm:
+            #     head.append(nn.LayerNorm(concatenated_dim))
+            #     head.append(nn.Dropout(dropout))
             head.append(nn.Linear(concatenated_dim, num_classes))
 
         return nn.Sequential(*head)
+    
+    def _build_layernorm_per_encoder(self, arch_setup: Dict[str, Any]) -> None:
+        """Build per-encoder LayerNorm modules if requested in the config.
+
+        This is a new feature in v2: the config flag ``classifier_layernorm`` is
+        authoritative and applies to both the one-layer and two-layer heads. If
+        enabled, we add a LayerNorm module for each encoder's output before
+        concatenation, so the classifier sees normalised features from each
+        encoder. The existing LayerNorm on the concatenated features (if enabled)
+        remains.
+        """
+        conf = arch_setup['classification_model']
+        use_layernorm = bool(conf.get('classifier_layernorm', False))
+        if not use_layernorm:
+            self.img_layernorm = None
+            self.fl_layernorm = None
+            return
+
+        img_feature_dim = self.img_encoder.get_output_dim()
+        fl_feature_dim = self.fl_encoder.get_output_dim()
+        self.img_layernorm = nn.LayerNorm(img_feature_dim)
+        self.fl_layernorm = nn.LayerNorm(fl_feature_dim)
+        logger.info("[HoloClassifierV2] Added per-encoder LayerNorm: img_dim=%s fl_dim=%s",
+                    img_feature_dim, fl_feature_dim)
 
     def _freeze_encoder(self, encoder: nn.Module, name: str) -> None:
         """
@@ -320,6 +346,12 @@ class HoloClassifierV2(nn.Module):
             feat_a = F.normalize(feat_a, p=2, dim=1)
             feat_b = F.normalize(feat_b, p=2, dim=1)
             feat_fl = F.normalize(feat_fl, p=2, dim=1)
+            
+        if self.img_layernorm is not None:
+            feat_a = self.img_layernorm(feat_a)
+            feat_b = self.img_layernorm(feat_b)
+        if self.fl_layernorm is not None:
+            feat_fl = self.fl_layernorm(feat_fl)
 
         combined_features = torch.cat((feat_a, feat_b, feat_fl), dim=1)
         return self.classifier(combined_features)

@@ -1,24 +1,30 @@
 '''
 @file    :   ssl_losses.py
 @create date : 2025-06-10 13:36:08
-@modify date 2026-04-29 12:15:17
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
 @license :   (C)Copyright 2026, Physikalisch-Technische Bundesanstalt (PTB) - BioAirMet Project
 @desc    :   [
     This file defines the loss functions used for self-supervised learning (SSL) in the BioAirMet project.
-    - ContrastiveLoss: An improved implementation of symmetric cross-entropy loss over similarity matrices. It features enhanced numerical stability through log-space temperature parameters, epsilon-normalized embeddings, and logit clamping to prevent NaN/Inf crashes during training.
+    - ContrastiveLoss: Legacy (non-CLIP) symmetric cross-entropy loss over similarity matrices with log-space temperature, epsilon-normalized embeddings and logit clamping. Not reachable from train.loss.name: its forward() takes no logit_scale, so SSLModel_SingleIMG cannot drive it.
+    - Clip_ContrastiveLoss: CLIP-style symmetric InfoNCE over the image / fluorescence embeddings, with optional cross-GPU gathering (emulate_old_loss / local_loss / gather_with_grad) and dtype promotion so an AMP image branch and an fp32 fluorescence branch can be compared.
     - negative_cosine_similarity: A utility function for computing cosine similarity based losses.
-    - build_ssl_loss_from_config: A factory function to instantiate SSL losses with support for learnable temperature parameters.
+    - SSL_LOSS_REGISTRY / SUPPORTED_SSL_LOSSES: The single source of truth for the names accepted by train.loss.name.
+    - resolve_ssl_temperature_keys: Shared resolution of the learnable_temp / learnable_temperature spellings (model factory, loss factory and optimizer grouping all read it).
+    - build_ssl_loss_from_config: Factory that instantiates the loss named in the config and fails fast on an unknown name.
     ]
 '''
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 import numpy as np
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 try:
     import torch.distributed.nn as dist_nn
@@ -158,6 +164,22 @@ class Clip_ContrastiveLoss(nn.Module):
     def forward(self, image_features, fl_features, logit_scale):
         rank, world_size = self._get_dist_info()
 
+        # --- Mixed-precision safety ---
+        # The image branch normally arrives in fp16 (AMP) while the fluorescence
+        # branch is deliberately kept in fp32 (its spectral values are far too
+        # small to survive fp16 rounding — see SSLModel_SingleIMG.fl_fp32).
+        # A matmul between the two dtypes would raise, so both sides are
+        # promoted to the wider one before the B x B similarity matrix and the
+        # cross-entropy are computed. Gradients still flow back into the fp16
+        # branch unchanged; this only avoids rounding inside the loss itself.
+        compute_dtype = torch.result_type(image_features, fl_features)
+        if image_features.dtype != compute_dtype:
+            image_features = image_features.to(compute_dtype)
+        if fl_features.dtype != compute_dtype:
+            fl_features = fl_features.to(compute_dtype)
+        if torch.is_tensor(logit_scale) and logit_scale.dtype != compute_dtype:
+            logit_scale = logit_scale.to(compute_dtype)
+
         # --- Old loss ---
         if self.emulate_old_loss or world_size == 1:
             logits = logit_scale * (image_features @ fl_features.t())
@@ -190,23 +212,160 @@ class Clip_ContrastiveLoss(nn.Module):
 
         return 0.5 * (loss_i + loss_f)
     
-# Factory function to build SSL loss from config
-def build_ssl_loss_from_config(config):
-    """
-    Builds an SSL loss function instance based on the provided configuration.
+# ---------------------------------------------------------------------------
+# Loss registry — single source of truth for ``train.loss.name`` (SSL)
+# ---------------------------------------------------------------------------
+
+SSL_LOSS_REGISTRY = {
+    # Symmetric CLIP InfoNCE over the two modality embeddings. Matches
+    # open_clip.ClipLoss, and for world_size == 1 its math exactly.
+    "Clip_ContrastiveLoss": Clip_ContrastiveLoss,
+    # Historical name shipped by the SSL config templates. It always selected
+    # the same symmetric InfoNCE objective, so it is kept as an explicit alias
+    # rather than being silently ignored in favour of a hard-coded class.
+    # The older non-CLIP ``ContrastiveLoss`` class above is deliberately NOT
+    # registered: its forward() takes no logit_scale and therefore cannot be
+    # driven by SSLModel_SingleIMG, which hands the model-owned temperature to
+    # the loss through compute_ssl_loss().
+    "ContrastiveLoss": Clip_ContrastiveLoss,
+}
+
+SUPPORTED_SSL_LOSSES = tuple(SSL_LOSS_REGISTRY)
+
+# Values applied when a key is absent from train.loss. They mirror the values
+# the SSL trainer hard-coded before the loss became config-routed, so existing
+# configs keep behaving exactly as before. (``emulate_old_loss`` has no effect
+# at world_size == 1: both branches compute the same symmetric InfoNCE.)
+SSL_LOSS_DEFAULTS = {
+    "name": "ContrastiveLoss",
+    "emulate_old_loss": True,
+    "local_loss": False,
+    "gather_with_grad": False,
+}
+
+
+def resolve_ssl_temperature_keys(loss_conf, log=None):
+    """Resolve ``(temperature, learnable_temp)`` from a ``train.loss`` section.
+
+    Two spellings of the learnable-temperature key exist in this project:
+    ``learnable_temp`` (the key the SSL templates ship and that
+    ``build_ssl_model_from_config`` reads) and ``learnable_temperature`` (the
+    key the loss classes take and the old factory documented). Reading only one
+    of them silently loses the setting, so both are accepted here and this is
+    the single place that resolves them — shared by the model factory, the loss
+    factory and the optimizer parameter grouping.
 
     Args:
-        config (EasyDict): Configuration object.
+        loss_conf: the ``config.train.loss`` mapping (dict / EasyDict / None).
+        log: optional logger for the disagreement warning.
+
+    Returns:
+        tuple: ``(temperature, learnable_temp)``. ``temperature`` is ``None``
+        when unset; ``learnable_temp`` is ``False`` for a missing/empty section
+        and ``None`` when the section exists but sets neither key, so callers
+        can fall back to their own default.
+    """
+    if not loss_conf:
+        return None, False
+
+    log = log or logging.getLogger(__name__)
+    temperature = loss_conf.get('temperature', None)
+
+    has_primary = 'learnable_temp' in loss_conf
+    has_alias = 'learnable_temperature' in loss_conf
+
+    learnable_temp = None
+    if has_primary:
+        learnable_temp = bool(loss_conf.get('learnable_temp', False))
+    elif has_alias:
+        learnable_temp = bool(loss_conf.get('learnable_temperature', False))
+
+    if has_primary and has_alias:
+        alias_value = bool(loss_conf.get('learnable_temperature', False))
+        if alias_value != learnable_temp:
+            log.warning(
+                "train.loss sets both 'learnable_temp'=%s and "
+                "'learnable_temperature'=%s and they disagree; using "
+                "'learnable_temp'=%s. Keep only one of the two keys.",
+                learnable_temp, alias_value, learnable_temp)
+
+    return temperature, learnable_temp
+
+
+# Factory function to build SSL loss from config
+def build_ssl_loss_from_config(config, log=None):
+    """Build the SSL loss selected by ``train.loss.name``.
+
+    The loss is resolved through :data:`SSL_LOSS_REGISTRY`; an unknown name is
+    a hard error rather than a silent fallback, because training with a
+    different objective than the one written in the config is exactly the kind
+    of bug that costs a multi-day run.
+
+    Config keys (all under ``train.loss``):
+        name: ``Clip_ContrastiveLoss`` or ``ContrastiveLoss`` (an alias of the
+            former). Defaults to ``SSL_LOSS_DEFAULTS['name']``.
+        emulate_old_loss: compute the symmetric InfoNCE on this rank's features
+            only, without gathering across GPUs (default True; identical math to
+            the joint form when world_size == 1).
+        local_loss: with emulate_old_loss False, use local query features
+            against the gathered key features (default False).
+        gather_with_grad: differentiable all-gather so every rank receives
+            gradients through the gathered features (default False).
+        temperature / learnable_temp / learnable_temperature: logged here; the
+            logit scale itself is owned by ``SSLModel_SingleIMG`` (see
+            ``build_ssl_model_from_config``), which reads the same keys through
+            :func:`resolve_ssl_temperature_keys`.
+
+    Args:
+        config: full configuration (needs ``config.train.loss``).
+        log: optional logger (defaults to this module's logger).
 
     Returns:
         torch.nn.Module: An instance of the specified SSL loss function.
+
+    Raises:
+        ValueError: if ``train.loss.name`` is not in the registry, or the
+            ``train.loss`` section is missing.
     """
-    loss_name = config.train.loss.get('name', 'ContrastiveLoss') # Default to ContrastiveLoss
-    
-    if loss_name == "ContrastiveLoss":
-        temperature = config.train.loss.get('temperature', 0.1)
-        learnable_temp = config.train.loss.get('learnable_temperature', False)
-        return ContrastiveLoss(temperature=temperature, learnable_temperature=learnable_temp)
-    
-    else:
-        raise ValueError(f"Unknown SSL loss function name: {loss_name}")
+    logger_ = log or logging.getLogger(__name__)
+
+    loss_conf = config.train.loss if (config and getattr(config, 'train', None)) else None
+    if not loss_conf:
+        raise ValueError(
+            "build_ssl_loss_from_config requires config.train.loss with a "
+            f"'name' key; supported: {', '.join(SUPPORTED_SSL_LOSSES)}.")
+
+    loss_name = loss_conf.get('name', 'ContrastiveLoss')
+    if loss_name not in SSL_LOSS_REGISTRY:
+        raise ValueError(
+            f"Unknown SSL loss: train.loss.name={loss_name!r}. "
+            f"Supported: {', '.join(SUPPORTED_SSL_LOSSES)}. The loss is "
+            "resolved through build_ssl_loss_from_config, so a typo fails at "
+            "startup instead of being silently ignored.")
+
+    temperature, learnable_temp = resolve_ssl_temperature_keys(loss_conf, logger_)
+    loss_cls = SSL_LOSS_REGISTRY[loss_name]
+
+    emulate_old = bool(loss_conf.get('emulate_old_loss',
+                                     SSL_LOSS_DEFAULTS['emulate_old_loss']))
+    local_loss = bool(loss_conf.get('local_loss',
+                                    SSL_LOSS_DEFAULTS['local_loss']))
+    gather_with_grad = bool(loss_conf.get('gather_with_grad',
+                                          SSL_LOSS_DEFAULTS['gather_with_grad']))
+
+    loss = loss_cls(emulate_old_loss=emulate_old,
+                    local_loss=local_loss,
+                    gather_with_grad=gather_with_grad)
+
+    logger_.info(
+        "SSL loss: train.loss.name=%s -> %s (emulate_old_loss=%s, "
+        "local_loss=%s, gather_with_grad=%s)",
+        loss_name, loss_cls.__name__, emulate_old, local_loss, gather_with_grad)
+    if loss_name != "Clip_ContrastiveLoss":
+        logger_.info("  ('%s' is an alias of 'Clip_ContrastiveLoss': symmetric "
+                     "InfoNCE over the two modality embeddings)", loss_name)
+    logger_.info(
+        "  temperature=%s learnable_temp=%s (the logit scale is owned by "
+        "SSLModel_SingleIMG / build_ssl_model_from_config)",
+        temperature, learnable_temp)
+    return loss

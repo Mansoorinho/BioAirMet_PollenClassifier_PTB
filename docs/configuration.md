@@ -736,9 +736,42 @@ views must not share a batch.
 
 ## Losses
 
-SSL (`train.loss.name`): `ContrastiveLoss` — plus the DDP loss behaviour
-flags `emulate_old_loss`, `local_loss`, `gather_with_grad` and the
-temperature settings (`temperature`, `learnable_temp`).
+SSL losses are resolved by name through
+`SSL_LOSS_REGISTRY` in `utils/ssl_losses.py`
+(`build_ssl_loss_from_config(config)`); an unknown `train.loss.name` aborts the
+run at startup with the list of supported names instead of falling back to a
+hard-coded class.
+
+| `train.loss.name` | Class | Notes |
+|---|---|---|
+| `Clip_ContrastiveLoss` | `Clip_ContrastiveLoss` | Symmetric InfoNCE over the image / fluorescence embeddings; matches `open_clip.ClipLoss` (for one process, the values, the embedding gradients and `d loss / d logit_scale` agree to ~1e-9). |
+| `ContrastiveLoss` | `Clip_ContrastiveLoss` | Historical name kept as an explicit alias — the same objective. |
+
+DDP behaviour flags (`train.loss`): `emulate_old_loss` (default `True`,
+compute the loss from this rank's features only), `local_loss`,
+`gather_with_grad`. The **validation** loss is always computed in the
+local-only form regardless of these flags, because validation runs on rank 0
+and cannot take part in an all-gather.
+
+The logit scale itself belongs to the model (`SSLModel_SingleIMG`), not to the
+loss: `temperature` and `learnable_temp` are read once by
+`resolve_ssl_temperature_keys()` and shared by the model factory, the loss
+factory and the optimizer grouping. `learnable_temperature` is accepted as an
+alias of `learnable_temp`; if both are present and disagree, `learnable_temp`
+wins and a warning is logged.
+
+### Fluorescence precision (SSL)
+
+`train.fl_encoder_fp32` (default `True`) runs `fl_encoder` + `fl_projector` and
+the contrastive loss in fp32 while the image branch keeps AMP fp16. fp16 has
+about three decimal digits, and the stored spectra are float32 values of order
+1e-3 … 1e-1 per channel, so an AMP cast changes ~98 % of the entries of a real
+batch (measured max error 2.4e-4 on
+`unlabeled_data_Aug07N12_final_v5_oldFixed.h5`) before the encoder ever sees
+them. The fluorescence MLP is tiny, so the fp32 branch costs nothing
+measurable; the SSL trainer also computes the loss **outside** the autocast
+region so the B×B similarity matrix and the two cross-entropies stay fp32. Set
+the flag to `False` only to reproduce old runs.
 
 Classification (`train.loss.name`):
 
@@ -853,7 +886,25 @@ training loop — all three read the same config keys.
 | `image_encoder_lr_multiplier` | `1.0` | LR multiplier for the (unfrozen) image-encoder group. |
 | `fluorescence_encoder_lr_multiplier` | `1.0` | LR multiplier for the (unfrozen) fluorescence-encoder group. |
 | `classifier_lr_multiplier` | `1.0` | LR multiplier for the classifier head (always trainable). |
-| `bn_bias_no_decay` | `False` | Exclude BN/bias parameters (ndim < 2) from weight decay. |
+| `bn_bias_no_decay` | `True` in code | Exclude every 1-D parameter (`ndim < 2`: BatchNorm gains/intercepts, biases, the SSL logit scale) from weight decay — the open_clip/timm convention. The SSL template ships `True`; the classification template still ships `False` so old Stage-2 runs reproduce exactly. |
+
+Each parameter group is named (`img_encoder/wd`, `img_encoder/no_wd`,
+`projectors/no_wd`, `temperature/no_wd`, …) and `build_optimizer_from_config`
+logs the resolved groups on rank 0, so the weight decay actually applied to a
+run is readable from `training.log` instead of having to be inferred from the
+code:
+
+```
+--- ADAMW parameter groups ---
+group                            tensors      params    1-D          lr       wd
+img_encoder/wd                        81   3,955,616      0   1.000e-03   0.0500
+img_encoder/no_wd                    130      51,356    130   1.000e-03   0.0000
+fl_encoder/wd                          2      34,432      0   1.000e-03   0.0500
+fl_encoder/no_wd                       4         640      4   1.000e-03   0.0000
+projectors/wd                          2     393,216      0   1.000e-03   0.0500
+projectors/no_wd                       2         512      2   1.000e-03   0.0000
+TOTAL                                221   4,435,772    136
+```
 
 ### What actually trains, verified at startup
 

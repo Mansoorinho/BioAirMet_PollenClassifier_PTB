@@ -1,7 +1,7 @@
 '''
 @file    :   base_trainer_v2.py
 @create date : 2026-01-10 14:04:08
-@modify date 2026-09-27 16:05:54
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -656,10 +656,20 @@ class BaseTrainerV2(ABC):
         # Load into model (handle DDP wrapper)
         target_model.load_state_dict(new_state_dict)
         
-        # Load optimizer if requested and available
+        # Load optimizer if requested and available.
         if load_optimizer and 'optimizer_state_dict' in checkpoint and self.optimizer is not None:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self._move_optimizer_to_device(self.optimizer, self.device)
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self._move_optimizer_to_device(self.optimizer, self.device)
+            except (ValueError, KeyError) as e:
+                if self.rank == 0:
+                    self.model_logger.warning(
+                        "Could not restore optimizer state (continuing with a "
+                        "fresh optimizer): %s. Expected when the checkpoint was "
+                        "written with a different parameter grouping, e.g. "
+                        "before the weight-decay/no-decay split in "
+                        "utils.optimizers or after changing "
+                        "train.fine_tuning.bn_bias_no_decay.", e)
         
         # Load scheduler if available.
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:

@@ -6,9 +6,13 @@ from .config_parser import (parse_config, load_and_merge_architecture_config, Co
 
 from .ssl_losses import (ContrastiveLoss, Clip_ContrastiveLoss,
                         negative_cosine_similarity,
-                        build_ssl_loss_from_config)
+                        build_ssl_loss_from_config,
+                        resolve_ssl_temperature_keys,
+                        SSL_LOSS_REGISTRY, SSL_LOSS_DEFAULTS,
+                        SUPPORTED_SSL_LOSSES)
 
 from .optimizers import (create_split_param_groups,
+                        describe_param_groups,
                         get_fine_tuning_param_groups,
                         build_optimizer_from_config,
                         build_scheduler_from_config,
@@ -60,7 +64,8 @@ __all__ = ['parse_config', 'load_and_merge_architecture_config', 'ConfigError', 
            'log_bn_and_freeze_state', 'unwrap_ddp_model',
            'is_resolved_config', 'load_experiment_config', 'save_resolved_config', 'format_resolved_yaml',
            'find_placeholder_paths', 'get_model_initialization', 'get_resume_section', 'ContrastiveLoss', 'Clip_ContrastiveLoss', 'CLIPCosineWarmupScheduler', 'negative_cosine_similarity', 'build_ssl_loss_from_config',
-           'create_split_param_groups', 'get_fine_tuning_param_groups', 'build_optimizer_from_config', 'build_scheduler_from_config', 'step_scheduler',
+           'resolve_ssl_temperature_keys', 'SSL_LOSS_REGISTRY', 'SSL_LOSS_DEFAULTS', 'SUPPORTED_SSL_LOSSES',
+           'create_split_param_groups', 'describe_param_groups', 'get_fine_tuning_param_groups', 'build_optimizer_from_config', 'build_scheduler_from_config', 'step_scheduler',
            'resolve_total_steps', 'is_step_based_scheduler', 'is_epoch_based_scheduler', 'restore_scheduler_state',
            'STEP_BASED_SCHEDULER_NAMES', 'EPOCH_BASED_SCHEDULER_NAMES',
            'EarlyStoppingV2', 'setup_logger', 'log_metrics_to_file', 'setup_model_logger', 'TensorboardLogger',

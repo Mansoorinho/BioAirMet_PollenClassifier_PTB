@@ -1,7 +1,7 @@
 '''
 @file    :   fluorescence_encoders.py
 @create date : 2025-06-05 10:26:08
-@modify date 2026-08-25
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   2.0
 @contact :   mansoor.nabawi@gmail.com
@@ -88,7 +88,7 @@ class FluorescenceMLP(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.2,
                  hidden_dims=(128,), activation: str = "relu", norm="ln",
-                 use_dropout: bool = True):
+                 use_dropout: bool = True, first_layer_bias: bool = True):
         super().__init__()
         self.output_dim = output_dim
 
@@ -98,7 +98,7 @@ class FluorescenceMLP(nn.Module):
         layers = []
         current_dim = input_dim
         for i, h_dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.Linear(current_dim, h_dim, bias=first_layer_bias if i == 0 else True))
             if i == 0 and norm_cls is not None:
                 layers.append(norm_cls(h_dim))
             layers.append(act)
@@ -193,6 +193,7 @@ def _build_fluorescence_mlp(fluo) -> nn.Module:
         hidden_dims=fluo.hidden_dim,
         activation=fluo.get('activation', 'relu'),
         norm=fluo.get('norm', 'bn'),
+        first_layer_bias=fluo.get('first_layer_bias', True),
     )
 
 

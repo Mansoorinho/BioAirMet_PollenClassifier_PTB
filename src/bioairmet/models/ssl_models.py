@@ -1,7 +1,7 @@
 '''
 @file    :   ssl_models.py
 @create date : 2025-02-10 13:36:08
-@modify date 2026-08-25
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   2.0
 @contact :   mansoor.nabawi@gmail.com
@@ -12,7 +12,10 @@
     SSLModel_SingleIMG: contrastive SSL model for one holographic image view
     + fluorescence features. Each modality has its own encoder (image backbone
     / fluorescence MLP) and its own projection head; a CLIP-style temperature
-    (static or learnable) scales the logits.
+    (static or learnable) scales the logits. The fluorescence branch is kept in
+    fp32 while the image branch may run under AMP (`fl_fp32`, read from
+    `train.fl_encoder_fp32`), because fp16 rounding measurably corrupts the
+    stored spectra - see SSLModel_SingleIMG.forward.
 
     Factory functions turn the merged architecture config into instances:
         build_ssl_model_from_config     -> SSLModel_SingleIMG
@@ -25,6 +28,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 from typing import Any, Dict, Optional, Tuple
 
 from ._common import load_state_dict, ensure_state_dict_metadata
@@ -119,6 +123,10 @@ class SSLModel_SingleIMG(nn.Module):
         freeze_bn: freeze BatchNorm layers at construction (default False).
         learnable_temperature: CLIP-style learnable logit scale (default False).
         init_temperature: initial temperature (default 0.1).
+        fl_fp32: keep the fluorescence encoder + projector in fp32 even when the
+            caller runs under AMP (default None -> resolved from
+            ``architecture_setup.ssl_model.fl_encoder_fp32``, then
+            ``train.fl_encoder_fp32``, then True). See :meth:`forward` for why.
         config: (legacy) full config dict; used to fill any argument left as
             None from `config['architecture_setup']['ssl_model']`.
     """
@@ -134,6 +142,7 @@ class SSLModel_SingleIMG(nn.Module):
                  freeze_bn: bool = False,
                  learnable_temperature: bool = False,
                  init_temperature: float = 0.1,
+                 fl_fp32: Optional[bool] = None,
                  config: Optional[Dict[str, Any]] = None):
         super().__init__()
 
@@ -159,6 +168,26 @@ class SSLModel_SingleIMG(nn.Module):
         projection_bias = _resolve("projector_bias", True, projection_bias)
         freeze_bn = bool(ssl_conf.get("freeze_bn", False) or freeze_bn)
 
+        # --- Fluorescence precision (fp32 vs AMP) ---
+        # `train.fl_encoder_fp32` (also accepted inside the ssl_model section)
+        # pins the fluorescence branch to fp32; enabled by default because fp16
+        # rounding measurably corrupts the stored spectra (see forward()).
+        train_conf: Dict[str, Any] = {}
+        if config is not None:
+            try:
+                train_conf = config.get("train") or {}
+            except AttributeError:
+                train_conf = {}
+        conf_fl_fp32 = ssl_conf.get("fl_encoder_fp32",
+                                    train_conf.get("fl_encoder_fp32", None))
+        if fl_fp32 is None:
+            fl_fp32 = True if conf_fl_fp32 is None else bool(conf_fl_fp32)
+        elif conf_fl_fp32 is not None and bool(conf_fl_fp32) != bool(fl_fp32):
+            logger.warning(
+                "SSLModel_SingleIMG: explicit fl_fp32=%s overrides "
+                "fl_encoder_fp32=%s from the config.", fl_fp32, conf_fl_fp32)
+        self.fl_fp32 = bool(fl_fp32)
+
         # --- 1. Encoders + projection heads (shared latent space) ---
         self.img_encoder = img_base_model
         self.fl_encoder = fl_base_model
@@ -173,6 +202,14 @@ class SSLModel_SingleIMG(nn.Module):
             fl_feature_dim, projection_dim=projection_dim,
             projector_type=projector_type, norm=norm_type,
             bias=projection_bias, activation=projection_activation)
+
+        if self.fl_fp32:
+            # Pin the fluorescence weights to fp32 so the autocast-disabled
+            # branch in forward() always sees matching dtypes. This is a no-op
+            # for the fp32 models this project builds (AMP is used for mixed
+            # precision, never model.half()).
+            self.fl_encoder.float()
+            self.fl_projector.float()
 
         # --- 2. CLIP-style temperature / logit scale ---
         self.learnable_temperature = learnable_temperature
@@ -191,9 +228,10 @@ class SSLModel_SingleIMG(nn.Module):
 
         logger.info(
             "SSLModel_SingleIMG: img_dim=%s fl_dim=%s projection_dim=%s "
-            "projector=%s/%s learnable_temperature=%s (init %s)",
+            "projector=%s/%s learnable_temperature=%s (init %s) fl_fp32=%s",
             img_feature_dim, fl_feature_dim, projection_dim,
-            projector_type, norm_type, learnable_temperature, init_temperature)
+            projector_type, norm_type, learnable_temperature, init_temperature,
+            self.fl_fp32)
 
     def freeze_batchnorm(self, scope: Optional[nn.Module] = None) -> int:
         """Freeze BatchNorm layers: ``eval()`` mode, KEEPING ``track_running_stats``.
@@ -257,21 +295,39 @@ class SSLModel_SingleIMG(nn.Module):
                   projection (same shape as ``image_embeddings``).
                 - ``logit_scale`` (torch.Tensor): the clamped temperature scale
                   (``exp(logit_scale)`` if learnable, else the static ``1/temperature``).
+
+        The two branches can legitimately have different dtypes (fp16 image
+        under AMP, fp32 fluorescence when ``fl_fp32`` is on);
+        ``Clip_ContrastiveLoss.forward`` promotes both to the wider one, so a
+        mismatch is never an error.
         """
         # Keep frozen encoders in eval mode even after model.train().
         for name in self._frozen_encoders:
             getattr(self, name).eval()
 
-        # --- A. Feature extraction ---
+        # --- A. Feature extraction + B. projection to the shared space ---
+        # The image branch runs in whatever precision the caller's autocast
+        # context selects (fp16 under AMP).
         img_a_proj = self.img_encoder(view_a)
-        fl_proj = self.fl_encoder(fl)
-
-        # --- B. Projection to the shared space ---
         img_a_proj = self.img_projector(img_a_proj)
-        fl_proj = self.fl_projector(fl_proj)
-
         img_a_proj = F.normalize(img_a_proj, p=2, dim=-1, eps=1e-8)
-        fl_proj = F.normalize(fl_proj, p=2, dim=-1, eps=1e-8)
+
+        # The fluorescence branch is kept in fp32 unless fl_fp32 is disabled.
+        # Why: the stored spectra are float32 values of order 1e-3..1e-1 per
+        # channel; fp16 has ~3 decimal digits, so autocast alters ~98% of the
+        # entries of a real batch (measured max error ~2.4e-4, i.e. larger than
+        # many spectral features themselves) before the encoder ever sees them.
+        # The fp32 cost is negligible here (a small MLP over a few hundred
+        # values), while the image branch keeps the AMP speed-up.
+        if self.fl_fp32:
+            with autocast(device_type=fl.device.type, enabled=False):
+                fl_proj = self.fl_encoder(fl.to(dtype=torch.float32))
+                fl_proj = self.fl_projector(fl_proj)
+                fl_proj = F.normalize(fl_proj, p=2, dim=-1, eps=1e-8)
+        else:
+            fl_proj = self.fl_encoder(fl)
+            fl_proj = self.fl_projector(fl_proj)
+            fl_proj = F.normalize(fl_proj, p=2, dim=-1, eps=1e-8)
 
         # --- C. Logit scale (temperature) with consistent clamping ---
         # CRITICAL: clamp here so train/val behave identically.
@@ -423,11 +479,23 @@ def build_ssl_model_from_config(config):
         )
 
     # Temperature lives in the loss config (train.loss); read it defensively.
+    # Both `learnable_temp` (SSL templates) and `learnable_temperature` (loss
+    # classes) spellings are accepted through the shared resolver, so the model,
+    # the loss and the optimizer parameter groups can never disagree about it.
     train_conf = config.get('train') if hasattr(config, 'get') else None
     loss_conf = train_conf.get('loss') if train_conf is not None else None
-    learnable_temp = bool(loss_conf.get('learnable_temp', False)) if loss_conf is not None else False
-    temperature = float(loss_conf.get('temperature', 0.1)) if loss_conf is not None else 0.1
+    try:
+        from ..utils.ssl_losses import resolve_ssl_temperature_keys
+        temperature, learnable_temp = resolve_ssl_temperature_keys(loss_conf, logger)
+    except Exception:  # pragma: no cover - keeps models importable standalone
+        temperature = loss_conf.get('temperature', None) if loss_conf else None
+        learnable_temp = loss_conf.get('learnable_temp', False) if loss_conf else False
+    temperature = float(temperature) if temperature is not None else 0.1
+    learnable_temp = bool(learnable_temp)
 
+    # NOTE: fluorescence precision is NOT passed here — SSLModel_SingleIMG
+    # resolves `train.fl_encoder_fp32` (or architecture_setup.ssl_model.
+    # fl_encoder_fp32) itself and logs the value it ended up with.
     ssl_model = _SSL_MODELS[model_name](
         img_base_model=img_base_model,
         fl_base_model=fl_base_model,

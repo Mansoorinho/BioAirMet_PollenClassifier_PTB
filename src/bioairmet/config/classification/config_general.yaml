@@ -266,7 +266,10 @@ train:
                                  # last (partial) window of an epoch is still applied,
                                  # so updates/epoch = ceil(steps_per_epoch / this value)
   mixed_precision: True # Enabled for performance
-
+  # if mixed_precision is True, the following two fields control the AMP and loss precision dtypes, otherwise they are ignored and float32 is used for all computations.
+  amp_dtype: "float16" # Options: "float16", "bfloat16". The default float16 is faster on Ampere+ GPUs, but bfloat16 is more robust on older GPUs (Turing, Volta, Pascal).
+  loss_precision_dtype: "float32" # Options: "float16", "bfloat16", "float32". The default float32 is more robust for loss computation, but float16 or bfloat16 can be used for speed if the loss is stable.
+  fl_encoder_fp32: False
   # --- THROUGHPUT SWITCHES ----------------------------------------------------
   # All three default to OFF in code; this template turns the first two on.
   # Measured during development (batch 64, 200x200, EfficientNet v2_100k,
@@ -282,7 +285,7 @@ train:
                        # results stay comparable with previous NCHW runs.
 
   # --- DATALOADER RNG STREAMS -------------------------------------------------
-  worker_seeding: True # Master on/off switch for worker RNG seeding.
+  worker_seeding: False # Master on/off switch for worker RNG seeding.
                        # True  = robust scheme: each worker's torch RNG keeps
                        #         PyTorch's auto-seed (the stream that gave the
                        #         most robust SSL runs); the random/numpy and

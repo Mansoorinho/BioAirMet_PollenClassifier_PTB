@@ -1,7 +1,7 @@
 '''
 @file    :   ssl_trainer_v2.py
 @create date : 2026-01-10 14:04:08
-@modify date 2026-05-27 12:31:54
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
@@ -36,7 +36,7 @@ from .base_trainer_v2 import (BaseTrainerV2, build_stage_dataloaders,
 from ..models import build_model_from_config
 from ..data import build_dataset_from_config
 from ..utils import (
-    # build_ssl_loss_from_config,
+    build_ssl_loss_from_config,
     build_optimizer_from_config,
     build_scheduler_from_config,
     step_scheduler,
@@ -45,7 +45,6 @@ from ..utils import (
     get_resume_section,
     EarlyStoppingV2,
     AverageMeter,
-    Clip_ContrastiveLoss,
     plot_ssl_metrics,
     CLIPCosineWarmupScheduler
 )
@@ -173,32 +172,39 @@ class SSLTrainerV2(BaseTrainerV2):
         # Wrap in DDP if multi-GPU
         self.model = self.wrap_model_ddp(self.model)
         
-        # Build loss.
-        # since we only use one gpu for validation we define two losses.
-        loss_cfg = self.config.train.loss
-        self.criterion = Clip_ContrastiveLoss(
-            emulate_old_loss=loss_cfg.get('emulate_old_loss', True),
-            local_loss=loss_cfg.get('local_loss', False),
-            gather_with_grad=loss_cfg.get('gather_with_grad', False)
+        # Build the losses from config: train.loss.name selects the objective
+        # through the SSL loss registry, so an unsupported or misspelled name
+        # fails at startup instead of being ignored in favour of a hard-coded
+        # class. The factory logs the resolved class and its flags.
+        # Two instances are needed because validation runs on rank 0 only.
+        self.criterion = build_ssl_loss_from_config(
+            self.config,
+            log=self.model_logger if self.rank == 0 else None,
         ).to(self.device)
 
-        self.val_criterion = Clip_ContrastiveLoss(
-            emulate_old_loss= True, ## Validation must use local loss to avoid cross-GPU communication
-        ).to(self.device)  # Validation cannot gather across ranks because only rank 0 runs it
+        # Validation must not gather across ranks (only rank 0 runs it), so the
+        # val loss always uses the local-only form regardless of the training
+        # setting; that also keeps the metric comparable across world sizes.
+        self.val_criterion = build_ssl_loss_from_config(self.config, log=None).to(self.device)
+        self.val_criterion.emulate_old_loss = True
+        self.val_criterion.local_loss = True
+        self.val_criterion.gather_with_grad = False
 
         if self.rank == 0:
             self.model_logger.info(
-                "SSL loss configured with "
-                f"emulate_old_loss={loss_cfg.get('emulate_old_loss', True)}, "
-                f"local_loss={loss_cfg.get('local_loss', False)}, "
-                f"gather_with_grad={loss_cfg.get('gather_with_grad', True)}"
-            )
+                "SSL validation loss forced to the local-only form "
+                "(emulate_old_loss=True, local_loss=True, gather_with_grad=False) "
+                "because validation runs on rank 0 only.")
 
-        # Build optimizer
+        # Build optimizer. Passing the logger makes the resolved parameter
+        # groups (name, tensors, params, LR, weight decay) readable in
+        # training.log, so the weight-decay assignment of a run is verifiable.
         param_groups = get_fine_tuning_param_groups(
             model=self.model, loss_module=self.criterion, config=self.config, mode='ssl'
         )
-        self.optimizer = build_optimizer_from_config(self.config, param_groups)
+        self.optimizer = build_optimizer_from_config(
+            self.config, param_groups,
+            logger=self.model_logger if self.rank == 0 else None)
         
         # Build scheduler if specified
         if self.config.train.get('scheduler'):
@@ -218,10 +224,28 @@ class SSLTrainerV2(BaseTrainerV2):
         
         # Setup mixed precision
         if self.use_mixed_precision:
+            amp_dtype = self.config.train.get('amp_dtype', 'float16')
+            loss_type = self.config.train.get('loss_precision_dtype', 'float32')
+            self.loss_dtype = torch.bfloat16 if loss_type == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if loss_type == 'float16' else torch.float32)
+            default_dtype = torch.get_autocast_dtype("cuda")
+            self.model_logger.info(f"Default autocast dtype: {default_dtype}, Configured AMP dtype: {amp_dtype}, Loss precision dtype: {self.loss_dtype}")
+            self.amp_dtype = torch.bfloat16 if amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if amp_dtype == 'float16' else torch.float32)
+        else:
+            self.amp_dtype = torch.float32 
+            self.loss_dtype = torch.float32
+            self.model_logger.info("Mixed precision disabled; using float32 for all computations.")
+            
+        if self.use_mixed_precision and amp_dtype == 'float16':
+            self.loss_dtype = torch.bfloat16 if loss_type == 'bfloat16' and torch.cuda.is_bf16_supported() else (torch.float16 if loss_type == 'float16' else torch.float32)
             self.scaler = GradScaler()
+            self.model_logger.info(f"Using mixed precision: {self.use_mixed_precision}, AMP dtype: {self.amp_dtype}, Loss precision dtype: {self.loss_dtype}")
+            try:
+                self.model_logger.info(f"GradScaler scale: {self.scaler.get_scale()}")
+            except Exception as e:
+                self.model_logger.warning(f"Could not get GradScaler scale: {e}")    
         else:
             self.scaler = None
-        
+            
         # Setup early stopping
         self.early_stopping = EarlyStoppingV2(
             patience=self.config.train.early_stopping.patience,
@@ -424,9 +448,10 @@ class SSLTrainerV2(BaseTrainerV2):
             
             # Forward pass with mixed precision. The model returns a dict with
             # 'image_embeddings', 'fl_embeddings' and 'logit_scale'.
-            with autocast(device_type=self.device.type, enabled=self.use_mixed_precision):
+            with autocast(device_type=self.device.type, enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                 model_output = self.model(images, fl_features)
-                loss = compute_ssl_loss(self.criterion, model_output)
+            loss = compute_ssl_loss(self.criterion, model_output.to(dtype=self.loss_dtype))
+            
             img_embeddings = model_output['image_embeddings']
             fl_embeddings = model_output['fl_embeddings']
             model_logit_scale = model_output['logit_scale']
@@ -549,9 +574,9 @@ class SSLTrainerV2(BaseTrainerV2):
                 fl_features = batch['fluorescence'].to(self.device, non_blocking=True)
                 
                 # validation to produce numerically identical results.
-                with autocast(device_type=self.device.type, enabled=self.use_mixed_precision):
+                with autocast(device_type=self.device.type, enabled=self.use_mixed_precision, dtype=self.amp_dtype):
                     model_output = self.model(images, fl_features)
-                    loss = compute_ssl_loss(self.val_criterion, model_output)
+                loss = compute_ssl_loss(self.val_criterion, model_output.to(dtype=self.loss_dtype))
 
                 # Metrics (match the training computation exactly). The embeddings
                 # are already L2-normalised inside the model, so no re-normalisation.
@@ -669,7 +694,7 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    # torch.cuda.manual_seed(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
     print(f"Seed set to {seed} for random, numpy, torch, and cudnn.")
@@ -705,7 +730,7 @@ def train_ssl_worker_v2(rank, world_size, config, device_id):
     train_loader, val_loader = build_stage_dataloaders(
         config, train_dataset, val_dataset, rank, world_size,
         train_drop_last=True,      # contrastive loss needs full batches
-        val_drop_last=True,
+        val_drop_last=False,
         train_always_sharded=True,  # SSL always uses a DistributedSampler
         val_sharded=False,          # validation runs on rank 0 only
         val_rank0_only=True,

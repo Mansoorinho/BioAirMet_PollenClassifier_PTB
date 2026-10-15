@@ -1,14 +1,15 @@
 '''
 @file    :   optimizers.py
 @create date : 2025-05-13 11:20:45
-@modify date 2026-02-26 15:25:56
+@modify date 2026-10-12
 @author  :   Mansoor Nabawi
 @version :   1.0
 @contact :   mansoor.nabawi@gmail.com
 @license :   (C)Copyright 2026, Physikalisch-Technische Bundesanstalt (PTB) - BioAirMet Project
 @desc    :   [
     This utility script provides specialized functions for setting up optimization routines in the BioAirMet project.
-    - create_split_param_groups: Implements weight decay exclusion for 1D parameters (biases and BatchNormalization weights) to improve regularization.
+    - create_split_param_groups: Weight-decay exclusion for 1-D parameters (biases, BatchNormalization weights, and scalars such as the CLIP logit scale), emitted as one decayed and one no-decay group per bucket — the rule open_clip uses (exclude_from_wd).
+    - describe_param_groups: Formats a parameter-group list (name, tensors, parameters, LR, weight decay) so the weight decay actually applied by a run is readable from the training log.
     - get_fine_tuning_param_groups: Manages complex parameter grouping logic for both SSL and Classification modes. It allows for selective freezing of encoders and the application of differentiated learning rate multipliers across different model components (e.g., image encoder vs. classifier head).
     - build_optimizer_from_config: A factory function to instantiate popular optimizers like AdamW, Adam, and SGD based on project configuration.
     - build_scheduler_from_config: A factory function to set up various learning rate schedules, including CosineAnnealing, OneCycleLR, and ReduceLROnPlateau.
@@ -27,20 +28,104 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 from ..models._common import select_last_n_layer_modules
 
-def create_split_param_groups(params, lr, weight_decay, bn_bias_no_decay=False):
-    """
-    Splits parameters into decay and no-decay groups based on their dimensionality.
-    Parameters with ndim < 2 (biases, normalization weights) get 0 weight decay.
-    """
-    param_groups = []
+def create_split_param_groups(params, lr, weight_decay, bn_bias_no_decay=True,
+                              group_name=None):
+    """Split parameters into a decayed and a no-decay group by dimensionality.
 
+    The exclusion rule is ``param.ndim < 2`` — i.e. every bias, every
+    normalisation gain/intercept and every scalar (the CLIP ``logit_scale``
+    included) is exempt from weight decay, and only matrices/conv kernels are
+    decayed. This is the same rule open_clip uses (``exclude_from_wd``:
+    ``param.ndim <= 1``) and the timm/CLIP convention: decaying 1-D parameters
+    is harmful because an adaptive optimizer's update magnitude is
+    scale-invariant, so a fixed decay dominates their gradient signal.
+
+    Parameters are batched into at most TWO groups (one decayed, one not)
+    instead of one group per tensor, so the optimizer sees a handful of groups
+    per bucket instead of ~150 with identical update semantics.
+
+    Args:
+        params: iterable of parameters.
+        lr (float): learning rate applied to both groups.
+        weight_decay (float): decay applied to the ``ndim >= 2`` group.
+        bn_bias_no_decay (bool): when True (default, recommended) 1-D
+            parameters get ``weight_decay=0.0``. Set False to restore the
+            legacy behaviour of decaying every parameter.
+        group_name (str | None): optional base name; the emitted groups are
+            named ``"<group_name>/wd"`` and ``"<group_name>/no_wd"`` so the
+            startup log shows where each group came from.
+
+    Returns:
+        list[dict]: parameter groups; empty groups are omitted.
+    """
+    decay, no_decay = [], []
     for param in params:
-        if param.ndim < 2 and bn_bias_no_decay:
-            param_groups.append({'params': [param], 'lr': lr, 'weight_decay': 0.0})
+        if bn_bias_no_decay and param.ndim < 2:
+            no_decay.append(param)
         else:
-            param_groups.append({'params': [param], 'lr': lr, 'weight_decay': weight_decay})
+            decay.append(param)
 
+    param_groups = []
+    if decay:
+        param_groups.append({
+            'params': decay,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'group_name': f"{group_name}/wd" if group_name else "wd",
+        })
+    if no_decay:
+        param_groups.append({
+            'params': no_decay,
+            'lr': lr,
+            'weight_decay': 0.0,
+            'group_name': f"{group_name}/no_wd" if group_name else "no_wd",
+        })
     return param_groups
+
+
+def describe_param_groups(param_groups, header="Optimizer parameter groups"):
+    """Format a param-group list as a human-readable table.
+
+    Reports, per group: its name (when the builder attached one), the number of
+    tensors, the number of parameters, the learning rate and the weight decay —
+    so the actual weight-decay assignment is readable in ``training.log``
+    instead of having to be inferred from the code.
+
+    Args:
+        param_groups (list[dict]): groups as produced by
+            :func:`get_fine_tuning_param_groups`.
+        header (str): first line of the table.
+
+    Returns:
+        str: the table (empty groups are skipped).
+    """
+    rows = []
+    for group in param_groups:
+        params = list(group.get('params', []))
+        if not params:
+            continue
+        n_tensors = len(params)
+        n_params = sum(p.numel() for p in params)
+        n_1d = sum(1 for p in params if p.ndim < 2)
+        rows.append((
+            str(group.get('group_name', '-')),
+            n_tensors, n_params, n_1d,
+            float(group.get('lr', float('nan'))),
+            float(group.get('weight_decay', float('nan'))),
+        ))
+
+    lines = [f"--- {header} ---"]
+    if not rows:
+        lines.append("(no trainable parameter groups)")
+        return "\n".join(lines)
+
+    lines.append(f"{'group':<32}{'tensors':>8}{'params':>12}{'1-D':>7}{'lr':>12}{'wd':>9}")
+    for name, n_tensors, n_params, n_1d, lr, wd in rows:
+        lines.append(f"{name:<32}{n_tensors:>8}{n_params:>12,}{n_1d:>7}{lr:>12.3e}{wd:>9.4f}")
+    lines.append(
+        f"{'TOTAL':<32}{sum(r[1] for r in rows):>8}"
+        f"{sum(r[2] for r in rows):>12,}{sum(r[3] for r in rows):>7}")
+    return "\n".join(lines)
 
 
 def _as_positive_int(value) -> int:
@@ -298,14 +383,19 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
     # Default learning rate from config
     base_lr = config.train.optimizer.lr
     base_weight_decay = config.train.optimizer.get('weight_decay', 0.0)
-    # Whether to exclude BN and bias from weight decay
-    bn_bias_no_decay = config.train.fine_tuning.get('bn_bias_no_decay', False)
+    # Whether to exclude BN/bias/scalar (1-D) parameters from weight decay.
+    # Defaults to True (the open_clip / timm convention): decaying normalisation
+    # gains and biases is harmful, and the CLIP recipe never does it. Set
+    # train.fine_tuning.bn_bias_no_decay: False to restore the old behaviour.
+    bn_bias_no_decay = config.train.fine_tuning.get('bn_bias_no_decay', True)
 
     # Collect all parameters and their names
     all_params = list(model.named_parameters())
-    train_loss_params = bool(
-        config.train.loss.get('learnable_temp', config.train.loss.get('learnable_temperature', False))
-    )
+    # `learnable_temp` is the key the SSL templates use, `learnable_temperature`
+    # the key the loss factory documents. Accept both, warn when they disagree,
+    # and share one resolution with the model/loss factories.
+    from .ssl_losses import resolve_ssl_temperature_keys
+    _temperature, train_loss_params = resolve_ssl_temperature_keys(config.train.loss)
 
     def _strip_ddp_prefix(param_name):
         # DDP adds 'module.' prefix; normalize names for robust matching
@@ -379,26 +469,30 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
                 param.requires_grad = True
                 _append_unique(other_params, param)
 
-        if image_encoder_params:
-            param_groups.append({
-                'params': image_encoder_params,
-                'lr': base_lr * image_encoder_lr_multiplier,
-                'weight_decay': base_weight_decay,
-            })
+        # Each bucket is split into a decayed and a no-decay group so that
+        # biases / BatchNorm gains / scalars are never weight-decayed
+        # (open_clip's exclude_from_wd rule). Group names are metadata for the
+        # startup log and are stripped before the optimizer is built.
+        param_groups.extend(create_split_param_groups(
+            image_encoder_params,
+            lr=base_lr * image_encoder_lr_multiplier,
+            weight_decay=base_weight_decay,
+            bn_bias_no_decay=bn_bias_no_decay,
+            group_name='img_encoder'))
 
-        if fluorescence_encoder_params:
-            param_groups.append({
-                'params': fluorescence_encoder_params,
-                'lr': base_lr * fluorescence_encoder_lr_multiplier,
-                'weight_decay': base_weight_decay,
-            })
+        param_groups.extend(create_split_param_groups(
+            fluorescence_encoder_params,
+            lr=base_lr * fluorescence_encoder_lr_multiplier,
+            weight_decay=base_weight_decay,
+            bn_bias_no_decay=bn_bias_no_decay,
+            group_name='fl_encoder'))
 
-        if other_params:
-            param_groups.append({
-                'params': other_params,
-                'lr': base_lr*projection_head_lr_multiplier,
-                'weight_decay': base_weight_decay,
-            })
+        param_groups.extend(create_split_param_groups(
+            other_params,
+            lr=base_lr * projection_head_lr_multiplier,
+            weight_decay=base_weight_decay,
+            bn_bias_no_decay=bn_bias_no_decay,
+            group_name='projectors'))
 
         # Optional learnable parameters from the loss module (e.g., temperature)
         # should use zero weight decay and their own LR multiplier.
@@ -416,6 +510,7 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
                 'params': loss_params,
                 'lr': base_lr * loss_lr_multiplier,
                 'weight_decay': 0.0,
+                'group_name': 'loss/no_wd',
             })
 
         if temperature_params:
@@ -423,6 +518,7 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
                 'params': temperature_params,
                 'lr': base_lr * temperature_lr_multiplier,
                 'weight_decay': 0.0,
+                'group_name': 'temperature/no_wd',
             })
             
     elif mode == 'classification':
@@ -509,13 +605,13 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
             'fluorescence_encoder_lr_multiplier', 1.0)
         classifier_lr_multiplier = config.train.fine_tuning.get(
             'classifier_lr_multiplier', 1.0)
-        img_fuser_lr_multiplier = config.train.fine_tuning.get(
-            'img_fuser_lr_multiplier', 0.01)
+        # img_fuser_lr_multiplier = config.train.fine_tuning.get(
+        #     'img_fuser_lr_multiplier', 0.01)
 
         image_encoder_params = []
         fluorescence_encoder_params = []
         classifier_params = []
-        img_fuser_params = []
+        LayerNorm_params = []
         seen_param_ids = set()
 
         def _append_unique(bucket, param):
@@ -545,34 +641,41 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
                 param.requires_grad = True
                 _append_unique(classifier_params, param)
 
-            if 'img_fuser' in name:
+            if 'img_layernorm' in name:
                 param.requires_grad = True
-                _append_unique(img_fuser_params, param)
+                _append_unique(LayerNorm_params, param)
+            if 'fl_layernorm' in name:
+                param.requires_grad = True
+                _append_unique(LayerNorm_params, param)
 
         if image_encoder_params:
             param_groups.extend(
                 create_split_param_groups(image_encoder_params,
                                           base_lr * image_encoder_lr_multiplier,
                                           base_weight_decay,
-                                          bn_bias_no_decay=bn_bias_no_decay))
+                                          bn_bias_no_decay=bn_bias_no_decay,
+                                          group_name='img_encoder'))
         if fluorescence_encoder_params:
             param_groups.extend(
                 create_split_param_groups(fluorescence_encoder_params,
                                           base_lr * fluorescence_encoder_lr_multiplier,
                                           base_weight_decay,
-                                          bn_bias_no_decay=bn_bias_no_decay))
+                                          bn_bias_no_decay=bn_bias_no_decay,
+                                          group_name='fl_encoder'))
         if classifier_params:
             param_groups.extend(
                 create_split_param_groups(classifier_params,
                                           base_lr * classifier_lr_multiplier,
                                           base_weight_decay,
-                                          bn_bias_no_decay=bn_bias_no_decay))
-        if img_fuser_params:
+                                          bn_bias_no_decay=bn_bias_no_decay,
+                                          group_name='classifier'))
+        if LayerNorm_params:
             param_groups.extend(
-                create_split_param_groups(img_fuser_params,
-                                          base_lr * img_fuser_lr_multiplier,
+                create_split_param_groups(LayerNorm_params,
+                                          base_lr, #* img_fuser_lr_multiplier,
                                           base_weight_decay,
-                                          bn_bias_no_decay=bn_bias_no_decay))
+                                          bn_bias_no_decay=bn_bias_no_decay,
+                                          group_name='img_fuser'))
 
     else:
         raise ValueError(
@@ -608,7 +711,8 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
                     fallback_ids.add(id(param))
 
         param_groups.extend(create_split_param_groups(
-            all_trainable, base_lr, base_weight_decay, bn_bias_no_decay=bn_bias_no_decay))
+            all_trainable, base_lr, base_weight_decay,
+            bn_bias_no_decay=bn_bias_no_decay, group_name='all_trainable'))
 
     # Safety check: ensure all expected trainable params are covered exactly once.
     grouped_param_ids = []
@@ -665,7 +769,7 @@ def get_fine_tuning_param_groups(model, loss_module, config, mode='ssl'):
 
     return param_groups
 
-def build_optimizer_from_config(config, param_groups):
+def build_optimizer_from_config(config, param_groups, logger=None):
     """
     Builds an optimizer instance based on the provided configuration.
 
@@ -673,6 +777,13 @@ def build_optimizer_from_config(config, param_groups):
         config (EasyDict): Configuration object.
         param_groups (list): A list of parameter groups, where each group is a dict
                              containing 'params' and optionally 'lr', 'weight_decay', etc.
+                             A 'group_name' key is accepted as logging metadata and
+                             is stripped before the groups reach the optimizer.
+        logger: optional logger; when given, the resolved groups (name, number of
+                tensors, number of parameters, LR and weight decay) are logged so
+                the weight-decay assignment of a run is verifiable from the log
+                instead of having to be inferred from the code. Callers should
+                pass a logger only on rank 0.
 
     Returns:
         torch.optim.Optimizer: An instance of the specified optimizer.
@@ -694,15 +805,22 @@ def build_optimizer_from_config(config, param_groups):
             group.setdefault('eps', default_eps)
             group.setdefault('betas', default_betas)
 
+    if logger is not None:
+        logger.info("\n%s", describe_param_groups(
+            param_groups, header=f"{optimizer_name.upper()} parameter groups"))
+
+    # 'group_name' is logging metadata, not an optimizer hyper-parameter.
+    groups = [{k: v for k, v in g.items() if k != 'group_name'} for g in param_groups]
+
     if optimizer_name == "adamw":
-        return optim.AdamW(param_groups)
+        return optim.AdamW(groups)
     elif optimizer_name == "adam":
-        return optim.Adam(param_groups)
+        return optim.Adam(groups)
     elif optimizer_name == "sgd":
         default_momentum = config.train.optimizer.get('momentum', 0.9)
-        for group in param_groups:
+        for group in groups:
             group.setdefault('momentum', default_momentum)
-        return optim.SGD(param_groups)
+        return optim.SGD(groups)
     else:
         raise ValueError(f"Unknown optimizer name: {optimizer_name}")
 

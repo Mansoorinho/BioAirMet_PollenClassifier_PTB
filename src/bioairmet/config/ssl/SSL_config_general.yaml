@@ -222,6 +222,17 @@ train:
 
   gradient_accumulation_steps: 1 # Number of steps to accumulate gradients before updating weights, when 1, no gradient accumulation
   mixed_precision: True # Enable/Disable Automatic Mixed Precision (AMP)
+  # The amp_dtype, and loss_precision_dtype is used only when mixed_precision is True
+  amp_dtype: "float16" # Options: "float16" | "bfloat16" | "float32"
+  loss_precision_dtype: "float16" # Only applied when using mixed precision. Options: "float16" | "bfloat16" | "float32" 
+  # Fluorescence-branch precision, independent of the switch above.
+  # fp16 has only ~3 decimal digits, which is not enough for the stored spectra
+  # (float32 values of order 1e-3..1e-1 per channel): under AMP ~98% of the
+  # entries of a real batch are changed by the cast (measured max error 2.4e-4,
+  # larger than many spectral features). True keeps fl_encoder + fl_projector
+  # and the contrastive loss in fp32 while the image encoder still runs in AMP
+  # fp16; the FL branch is a small MLP, so the cost is negligible.
+  fl_encoder_fp32: False
 
   # --- THROUGHPUT SWITCHES ----------------------------------------------------
   # All three default to OFF in code; this template turns the first two on.
@@ -238,7 +249,7 @@ train:
                        # results stay comparable with previous NCHW runs.
 
   # --- DATALOADER RNG STREAMS -------------------------------------------------
-  worker_seeding: True # Master on/off switch for worker RNG seeding.
+  worker_seeding: False # Master on/off switch for worker RNG seeding.
                        # True  = robust scheme: each worker's torch RNG keeps
                        #         PyTorch's auto-seed (the stream that gave the
                        #         most robust SSL runs); the random/numpy and
@@ -296,9 +307,10 @@ train:
     # total_steps: null # absolute override of the cycle length (optimiser steps)
 
   loss:
-    name: "ContrastiveLoss" # SigLIPLoss, ContrastiveLoss
+    name: "ContrastiveLoss"
+    # logit_scale = 1/temperature (fixed unless learnable_temp is True).
     temperature: 0.1 # Higher temperature prevents overconfident predictions and representation collapse
-    learnable_temp: False
+    learnable_temp: False # 'learnable_temperature' is accepted as an alias; keep only one of the two
     # loss settings on DDP
     emulate_old_loss: True # Whether to emulate the old loss behavior where the loss is computed on each GPU locally without gathering features across GPUs.
     # if above is True, the following is ignored, if False, the following settings determine how to compute the loss in DDP:
@@ -310,7 +322,7 @@ train:
     min_delta: 0.001
 
   fine_tuning:
-    bn_bias_no_decay: False # Whether to exclude BatchNorm and bias parameters from weight decay
+    bn_bias_no_decay: False # Exclude 1-D parameters (BatchNorm gains/intercepts, biases, the logit scale) from weight decay - the open_clip/timm convention.
     freeze_image_encoder: False
     freeze_fluorescence_encoder: False
     image_encoder_lr_multiplier: 1.0
